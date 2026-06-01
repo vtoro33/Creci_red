@@ -14,6 +14,9 @@ st.markdown("""
 .mval{font-size:28px;font-weight:700;color:#fff}
 .mdelta{font-size:12px;color:#68d391;margin-top:6px}
 .pending{background:rgba(255,255,255,0.04);border:0.5px solid rgba(255,255,255,0.08);border-radius:14px;padding:40px;text-align:center;color:rgba(255,255,255,0.3)}
+.nota{background:linear-gradient(135deg,#1a2035,#1e2a4a);border-left:3px solid #63b3ed;border-radius:0 10px 10px 0;padding:12px 18px;margin:8px 0 18px 0}
+.nota-texto{font-size:12px;color:rgba(255,255,255,0.6);line-height:1.7}
+.nota-fecha{color:#63b3ed;font-weight:600}
 </style>
 """, unsafe_allow_html=True)
 
@@ -44,7 +47,7 @@ def cargar():
             frames.append(df[cols_presentes])
     if frames:
         df = pd.concat(frames, ignore_index=True)
-        df["fecha_carga"] = pd.to_datetime(df["fecha_carga"])
+        df["fecha_carga"] = pd.to_datetime(df["fecha_carga"], format='mixed')
         return df.sort_values("fecha_carga")
     return pd.DataFrame(columns=COLS)
 
@@ -57,7 +60,8 @@ def slabel(fecha):
     return f"{f.day} {m}"
 
 def tarjeta(label, val, delta, color):
-    d = f'<div class="mdelta">↑ {int(delta):,} vs semana anterior</div>' if delta and delta > 0 else ""
+    # CAMBIO 1: "vs semana anterior" → "vs lectura anterior"
+    d = f'<div class="mdelta">↑ {int(delta):,} vs lectura anterior</div>' if delta and delta > 0 else ""
     st.markdown(f'<div class="mcard"><div class="mlabel">{label}</div><div class="mval" style="color:{color}">{int(val):,}</div>{d}</div>', unsafe_allow_html=True)
 
 def grafica(df, col, color, titulo):
@@ -124,12 +128,37 @@ def vista(vendor):
 h1, h2 = st.columns([3, 1])
 with h1:
     st.markdown("## 🖧 Red FTTH — Crecimiento")
-    ultima = hist["fecha_carga"].max().strftime("%d %b %Y") if not hist.empty else "Sin datos"
-    st.markdown(f"<p style='color:rgba(255,255,255,0.35);font-size:12px;margin-top:-10px'>Última carga: {ultima}</p>", unsafe_allow_html=True)
+    # CAMBIO 2: mostrar hora si está disponible
+    if not hist.empty:
+        ultima = hist["fecha_carga"].max()
+        if ultima.hour == 0 and ultima.minute == 0:
+            ultima_str = ultima.strftime("%d %b %Y")
+        else:
+            ultima_str = ultima.strftime("%d %b %Y — %H:%M")
+    else:
+        ultima_str = "Sin datos"
+    st.markdown(f"<p style='color:rgba(255,255,255,0.35);font-size:12px;margin-top:-10px'>Última ejecución: {ultima_str}</p>", unsafe_allow_html=True)
 with h2:
     if st.button("⟳ Actualizar datos"):
         st.cache_data.clear()
         st.rerun()
+
+# CAMBIO 3: nota informativa
+if not hist.empty:
+    ultima_nota = hist["fecha_carga"].max()
+    if ultima_nota.hour == 0 and ultima_nota.minute == 0:
+        fecha_nota = ultima_nota.strftime("%d de %B de %Y")
+    else:
+        fecha_nota = ultima_nota.strftime("%d de %B de %Y a las %H:%M")
+    st.markdown(f"""
+    <div class="nota">
+        <div class="nota-texto">
+            📋 Los valores reportados corresponden únicamente a equipos activos y operativos en la red residencial FTTH
+            a <span class="nota-fecha">{fecha_nota}</span>.
+            Esta fecha y hora corresponde al momento de ejecución y depuración de los scripts de procesamiento.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 

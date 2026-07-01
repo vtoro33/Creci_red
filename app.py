@@ -1802,7 +1802,12 @@ def mostrar_notas_publicas(vendor_tag):
 # ── Header ────────────────────────────────────────────────────────────────────
 hist = cargar()
 
-h1, h2, h3 = st.columns([3, 1, 0.3])
+h0, h1, h2, h3 = st.columns([0.35, 3, 1, 0.3])
+
+with h0:
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    st.image("Claro-logo_1.png", width=70)
+
 with h1:
     st.markdown("## 🖧 Red FTTH — Crecimiento")
     if not hist.empty:
@@ -1847,7 +1852,7 @@ with t0:
         total_olts      = int(ultimos["total_olts"].sum())
         total_troncales = int(ultimos["total_troncales"].sum())
         total_onts      = int(ultimos["total_onts"].sum())
-        st.markdown("#### ⎔ Total Red")
+        st.markdown("#### ⎔ Consolidado General")
         tc1, tc2, tc3 = st.columns(3)
         with tc1:
             st.markdown(f'<div class="mcard" style="border-color:#f6ad5544"><div class="mlabel" style="color:#f6ad55">⬡ Total OLTs</div><div class="mval">{total_olts:,}</div></div>', unsafe_allow_html=True)

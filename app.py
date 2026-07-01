@@ -2,7 +2,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import plotly.graph_objects as go
-import os, io, re, hashlib, glob, zipfile
+import os, io, re, hashlib, glob, zipfile, uuid, html
 from datetime import datetime, timedelta
 from dotenv import load_dotenv, set_key
 
@@ -51,6 +51,16 @@ COLORES = {
 }
 COLS = ["vendor", "fecha_carga", "total_olts", "total_troncales", "total_onts"]
 VENDOR_NOMBRE = {"ZTE": "ZTE", "HAW": "HUAWEI", "ATP": "ATP", "ONNET": "ONNET"}
+
+# Notas por pestaña
+NOTAS_PATH = os.path.join(DATA_DIR, "notas.csv")
+TABS_NOTAS = {
+    "GENERAL": "⎔ General",
+    "ZTE":     "⊞ ZTE",
+    "HAW":     "⊞ Huawei",
+    "ATP":     "⊞ ATP",
+    "ONNET":   "⊞ ONNET",
+}
 
 # Configuración de columnas para detalle por OLT (por vendor)
 DETALLE_CONFIG = {
@@ -136,9 +146,10 @@ ul[role="listbox"]{max-height:220px !important}
 
 # ── Session state init ────────────────────────────────────────────────────────
 for k, v in {
-    "admin_logged":    False,
-    "login_attempts":  0,
-    "lockout_until":   None,
+    "admin_logged":      False,
+    "admin_dialog_open": False,
+    "login_attempts":    0,
+    "lockout_until":     None,
     "resultado_zte":   None,
     "resultado_atp":   None,
     "resultado_haw":   None,
@@ -151,6 +162,7 @@ for k, v in {
     "publicado_atp":   False,
     "publicado_haw":   False,
     "publicado_onnet": False,
+    "confirmar_borrado_nota": None,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -261,6 +273,14 @@ def vista(vendor, hist):
         return
     ultimo   = df.iloc[-1]
     anterior = df.iloc[-2] if len(df) > 1 else None
+
+    st.markdown(
+        '<div class="warn-box"><div class="warn-text">⚠ Esta información corresponde '
+        'al estado puntual de la red al momento del procesamiento de las bases y puede '
+        'variar según el estado de los equipos al momento de la consulta. Cifras en cero '
+        'pueden deberse a equipos temporalmente offline.</div></div>',
+        unsafe_allow_html=True)
+
     c1, c2, c3 = st.columns(3)
     with c1:
         delta = int(ultimo["total_olts"] - anterior["total_olts"]) if anterior is not None else None
@@ -528,6 +548,35 @@ def limpiar_temp():
     for f in glob.glob(os.path.join(TEMP_DIR, "*")):
         if os.path.isfile(f) and datetime.fromtimestamp(os.path.getmtime(f)) < limite:
             os.remove(f)
+
+@st.cache_data
+def cargar_notas():
+    if os.path.exists(NOTAS_PATH):
+        df = pd.read_csv(NOTAS_PATH, dtype={"id": str, "vendor": str, "texto": str})
+        return df
+    return pd.DataFrame(columns=["id", "vendor", "texto", "fecha"])
+
+def guardar_nota(vendor, texto):
+    ruta  = NOTAS_PATH
+    fila  = pd.DataFrame([{
+        "id":     uuid.uuid4().hex[:8],
+        "vendor": vendor,
+        "texto":  texto.strip(),
+        "fecha":  datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }])
+    if os.path.exists(ruta):
+        df = pd.read_csv(ruta, dtype={"id": str, "vendor": str, "texto": str})
+        df = pd.concat([df, fila], ignore_index=True)
+    else:
+        df = fila
+    df.to_csv(ruta, index=False)
+
+def borrar_nota(nota_id):
+    if not os.path.exists(NOTAS_PATH):
+        return
+    df = pd.read_csv(NOTAS_PATH, dtype={"id": str, "vendor": str, "texto": str})
+    df = df[df["id"] != nota_id]
+    df.to_csv(NOTAS_PATH, index=False)
 
 def guardar_historico(vendor, metricas):
     ruta  = os.path.join(DATA_DIR, f"historico_{vendor}.csv")
@@ -1064,6 +1113,14 @@ def procesar_huawei(archivos, grupo_tronc, pb, stxt):
 
 
 def procesar_onnet(archivos, pb, stxt):
+    """Depuración ONNET — misma lógica que el script R 'DEPURACIÓN ONNET v1.4 (conteo histórico)'.
+
+    A diferencia de la versión anterior, NO se filtra por la fecha más reciente antes de
+    depurar: se conserva y depura todo el histórico. Luego se determina, por SERIAL, cuál
+    es su OLT/TRK RR vigente (el registro más reciente) y se marca cada ONT como ACTIVO
+    (si su último registro corresponde a la fecha más reciente del histórico) o INACTIVO
+    (si su último registro es de una fecha anterior).
+    """
     log   = []
     ts    = datetime.now().strftime("%Y-%m-%d_%H%M")
     pasos = 6
@@ -1076,7 +1133,8 @@ def procesar_onnet(archivos, pb, stxt):
 
     COLS_ONNET = ["SERIAL","OLT","TRK RR","FECHA"]
 
-    stxt.markdown('<div class="step-line">⟳ Leyendo archivos ONNET...</div>', unsafe_allow_html=True)
+    # ── PASO 1: Leer y consolidar TODOS los archivos (histórico completo) ──
+    stxt.markdown('<div class="step-line">⟳ Leyendo y consolidando archivos ONNET...</div>', unsafe_allow_html=True)
     lista = []
     for f in archivos:
         try:
@@ -1091,59 +1149,101 @@ def procesar_onnet(archivos, pb, stxt):
         lista.append(df)
 
     base_raw = pd.concat(lista, ignore_index=True)
-    avanzar(f"Archivos leídos: {len(base_raw):,} registros")
-
-    stxt.markdown('<div class="step-line">⟳ Filtrando fecha más reciente...</div>', unsafe_allow_html=True)
     base_raw["FECHA"] = pd.to_datetime(base_raw["FECHA"], errors="coerce").dt.date
+    avanzar(f"Archivos leídos y consolidados: {len(base_raw):,} registros históricos")
+
+    # ── PASO 2: Detectar la fecha más reciente (informativa; NO se filtra el histórico) ──
     fecha_max = base_raw["FECHA"].max()
-    base      = base_raw[base_raw["FECHA"] == fecha_max].copy()
-    avanzar(f"Fecha más reciente: {fecha_max} — {len(base):,} registros")
+    avanzar(f"Fecha más reciente detectada: {fecha_max}")
 
-    stxt.markdown('<div class="step-line">⟳ Depurando registros...</div>', unsafe_allow_html=True)
-    n_inicio = len(base)
+    # ── PASO 3: Depuración sobre TODO el histórico ──
+    stxt.markdown('<div class="step-line">⟳ Depurando registros (histórico completo)...</div>', unsafe_allow_html=True)
+    n_inicio = len(base_raw)
 
-    olt_str = base["OLT"].astype(str).str.strip()
-    m = base["OLT"].isna() | (~olt_str.str.startswith("OH"))
-    log += [{"regla":"R1","campo":"OLT","valor":str(r["OLT"]),"motivo":"No inicia con OH","archivo":r["archivo_fuente"]} for _,r in base[m].iterrows()]
-    base = base[~m].copy()
+    # [R1] OLT debe empezar por "OH"
+    olt_str = base_raw["OLT"].astype(str).str.strip()
+    m1 = base_raw["OLT"].isna() | (~olt_str.str.startswith("OH"))
+    log += [{"regla":"R1","campo":"OLT","valor":str(r["OLT"]),"motivo":"No inicia con OH","archivo":r["archivo_fuente"]} for _,r in base_raw[m1].iterrows()]
+    base_d1 = base_raw[~m1].copy()
 
+    # [R2] SERIAL con prefijo no reconocido: solo advertencia, NO se elimina
     patron  = "^(" + "|".join(PREFIJOS_SERIAL) + ")"
-    ser_str = base["SERIAL"].astype(str).str.strip()
-    m_raro  = base["SERIAL"].isna() | (~ser_str.str.match(patron))
+    ser_str = base_d1["SERIAL"].astype(str).str.strip()
+    m_raro  = base_d1["SERIAL"].isna() | (~ser_str.str.match(patron))
     if m_raro.any():
-        log += [{"regla":"R2","campo":"SERIAL","valor":str(r["SERIAL"]),"motivo":"Prefijo no reconocido (advertencia)","archivo":r["archivo_fuente"]} for _,r in base[m_raro].iterrows()]
+        log += [{
+            "regla":"R2","campo":"SERIAL","valor":str(r["SERIAL"]),
+            "motivo":f"Prefijo no reconocido — revisar ({'/'.join(PREFIJOS_SERIAL)})",
+            "archivo":r["archivo_fuente"],
+        } for _,r in base_d1[m_raro].iterrows()]
 
-    m_vacio  = base["SERIAL"].isna() | (base["SERIAL"].astype(str).str.strip() == "")
-    log     += [{"regla":"R3","campo":"SERIAL","valor":"(vacío)","motivo":"Serial vacío o nulo","archivo":"ONNET"} for _ in range(m_vacio.sum())]
-    base_dep = base[~m_vacio].copy()
-    avanzar(f"Depuración: {len(base_dep):,} válidos de {n_inicio:,}")
+    # [R3] SERIAL no puede ser vacío o nulo
+    m_vacio  = base_d1["SERIAL"].isna() | (base_d1["SERIAL"].astype(str).str.strip() == "")
+    log     += [{
+        "regla":"R3","campo":"SERIAL","valor":"(vacío)",
+        "motivo":"Serial vacío o nulo — eliminado","archivo":str(r["archivo_fuente"]),
+    } for _,r in base_d1[m_vacio].iterrows()]
 
-    stxt.markdown('<div class="step-line">⟳ Calculando métricas...</div>', unsafe_allow_html=True)
+    base_dep = base_d1[~m_vacio].copy()
+    avanzar(f"Depuración histórica: {len(base_dep):,} válidos de {n_inicio:,}")
+
+    # ── PASO 4: Relación ONT → OLT vigente + estado (ACTIVO / INACTIVO) ──
+    # Un ONT puede tener varios registros en el histórico (distintas fechas).
+    # Se toma el más reciente por SERIAL → esa es la OLT/TRK RR "vigente" del ONT.
+    stxt.markdown('<div class="step-line">⟳ Relacionando cada ONT con su OLT y marcando estado...</div>', unsafe_allow_html=True)
+    base_relacion = (
+        base_dep.sort_values("FECHA", ascending=False, kind="mergesort")
+        .drop_duplicates(subset="SERIAL", keep="first")
+        .copy()
+    )
+    base_relacion["ESTADO"] = base_relacion["FECHA"].apply(lambda f: "ACTIVO" if f == fecha_max else "INACTIVO")
+
+    n_activos   = int((base_relacion["ESTADO"] == "ACTIVO").sum())
+    n_inactivos = int((base_relacion["ESTADO"] == "INACTIVO").sum())
+
+    # Log de advertencia: ONTs que NO están activos en la fecha más reciente
+    if n_inactivos > 0:
+        inactivos = base_relacion[base_relacion["ESTADO"] == "INACTIVO"]
+        log += [{
+            "regla":"INACTIVO","campo":"SERIAL","valor":str(r["SERIAL"]),
+            "motivo": f"INACTIVO — última vez visto {r['FECHA']} en OLT {r['OLT']} / TRK RR {r['TRK RR']} (no aparece en {fecha_max})",
+            "archivo": r["archivo_fuente"],
+        } for _,r in inactivos.iterrows()]
+
+    avanzar(f"Relación ONT-OLT: {n_activos:,} activos / {n_inactivos:,} inactivos")
+
+    # ── PASO 5: Métricas (histórico) ──
     metricas = {
-        "vendor":          "ONNET",
-        "fecha_carga":     datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "total_olts":      int(base_dep["OLT"].nunique()),
-        "total_troncales": int(base_dep["TRK RR"].nunique()),
-        "total_onts":      int(base_dep["SERIAL"].nunique()),
+        "vendor":               "ONNET",
+        "fecha_carga":          datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "fecha_analizada":      str(fecha_max),
+        "total_olts":           int(base_dep["OLT"].nunique()),
+        "total_troncales":      int(base_dep["TRK RR"].nunique()),
+        "total_onts":           int(base_dep["SERIAL"].nunique()),
+        "total_onts_activos":   n_activos,
+        "total_onts_inactivos": n_inactivos,
     }
     avanzar("Métricas calculadas")
 
+    # ── PASO 6: Exportar archivos ──
     log_df = pd.DataFrame(log) if log else pd.DataFrame()
-    az = {f"base_ONNET_{ts}.csv": csv_bytes(base_dep)}
+    az = {f"relacion_ONT_OLT_{ts}.csv": csv_bytes(base_relacion)}
     if not log_df.empty:
         az[f"log_depuracion_ONNET_{ts}.csv"] = csv_bytes(log_df)
     avanzar("Archivos listos para descarga")
     pb.progress(1.0)
 
     return {
-        "metricas":    metricas,
-        "base":        base_dep,
-        "log":         log_df,
-        "archivos_zip":az,
-        "ts":          ts,
-        "n_inicio":    n_inicio,
-        "n_final":     len(base_dep),
-        "fecha_max":   fecha_max,
+        "metricas":     metricas,
+        "base":         base_relacion,  # 1 fila por SERIAL, OLT/TRK RR vigente + ESTADO
+        "log":          log_df,
+        "archivos_zip": az,
+        "ts":           ts,
+        "n_inicio":     n_inicio,
+        "n_final":      len(base_dep),
+        "fecha_max":    fecha_max,
+        "n_activos":    n_activos,
+        "n_inactivos":  n_inactivos,
     }, None
 
 
@@ -1475,7 +1575,13 @@ def panel_onnet():
 
     if st.session_state.get("resultado_onnet"):
         r = st.session_state["resultado_onnet"]
-        bloque_resultado("onnet", [r["metricas"]], "#f6ad55")
+        m = r["metricas"]
+        st.markdown(f'''<div class="nota"><div class="nota-texto">
+            ≡ Fecha más reciente del histórico: <span class="nota-fecha">{m.get("fecha_analizada","")}</span> ·
+            ONTs activos: <b style="color:#68d391">{m.get("total_onts_activos", 0):,}</b> ·
+            ONTs inactivos: <b style="color:#fc8181">{m.get("total_onts_inactivos", 0):,}</b>
+        </div></div>''', unsafe_allow_html=True)
+        bloque_resultado("onnet", [m], "#f6ad55")
         if st.button("↺ Nuevo procesamiento ONNET", key="reset_onnet"):
             st.session_state["resultado_onnet"] = None
             st.session_state["publicado_onnet"] = False
@@ -1518,6 +1624,82 @@ def panel_onnet():
         st.rerun(scope="app")  # necesario para mostrar bloque_resultado sin uploader
 
 
+@st.fragment
+def panel_notas():
+    st.markdown('<div class="section-title">⊙ Notas</div>', unsafe_allow_html=True)
+
+    # ── Agregar nota ──
+    vendor_sel = st.selectbox(
+        "Pestaña", list(TABS_NOTAS.keys()),
+        format_func=lambda v: TABS_NOTAS[v], key="nota_vendor_select",
+    )
+    texto_nuevo = st.text_area("Nueva nota", key="nota_texto_nueva", placeholder="Escribe la nota...")
+    if st.button("＋ Agregar nota", key="btn_agregar_nota"):
+        if texto_nuevo.strip():
+            guardar_nota(vendor_sel, texto_nuevo)
+            st.cache_data.clear()
+            del st.session_state["nota_texto_nueva"]
+            mostrar_ok("Nota agregada.")
+            st.rerun(scope="app")
+        else:
+            mostrar_error("La nota no puede estar vacía.")
+
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
+    # ── Listado de notas existentes, agrupadas por pestaña ──
+    df_notas = cargar_notas()
+    if df_notas.empty:
+        mostrar_ok("No hay notas registradas todavía.")
+    else:
+        for vendor_tag in TABS_NOTAS:
+            sub = df_notas[df_notas["vendor"] == vendor_tag].sort_values("fecha", ascending=False)
+            if sub.empty:
+                continue
+            st.markdown(f"**{TABS_NOTAS[vendor_tag]}**")
+            for _, row in sub.iterrows():
+                nid        = row["id"]
+                texto_html = html.escape(str(row["texto"])).replace("\n", "<br>")
+                c1, c2 = st.columns([6, 1])
+                with c1:
+                    st.markdown(
+                        f'<div class="nota"><div class="nota-texto">{texto_html}<br>'
+                        f'<span style="color:rgba(255,255,255,0.35);font-size:11px">{row["fecha"]}</span></div></div>',
+                        unsafe_allow_html=True,
+                    )
+                with c2:
+                    if st.button("🗑", key=f"btn_del_nota_{nid}", help="Borrar nota"):
+                        st.session_state["confirmar_borrado_nota"] = nid
+                        st.rerun(scope="app")
+            st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+
+    # ── Confirmación de borrado (requiere contraseña) ──
+    pendiente = st.session_state.get("confirmar_borrado_nota")
+    if pendiente:
+        fila   = df_notas[df_notas["id"] == pendiente]
+        previa = html.escape(str(fila.iloc[0]["texto"]))[:120] if not fila.empty else ""
+        st.markdown(
+            f'<div class="warn-box"><div class="warn-text">⚠ Vas a borrar esta nota: "{previa}". '
+            f'Ingresa la contraseña para confirmar.</div></div>',
+            unsafe_allow_html=True,
+        )
+        pwd_borrar = st.text_input("Contraseña", type="password", key="pwd_borrar_nota")
+        cc1, cc2 = st.columns([1, 1])
+        with cc1:
+            if st.button("✕ Confirmar borrado", key="btn_confirmar_borrado_nota"):
+                if verificar_password(pwd_borrar):
+                    borrar_nota(pendiente)
+                    st.cache_data.clear()
+                    st.session_state["confirmar_borrado_nota"] = None
+                    mostrar_ok("Nota borrada.")
+                    st.rerun(scope="app")
+                else:
+                    mostrar_error("Contraseña incorrecta.")
+        with cc2:
+            if st.button("Cancelar", key="btn_cancelar_borrado_nota"):
+                st.session_state["confirmar_borrado_nota"] = None
+                st.rerun(scope="app")
+
+
 def panel_password():
     st.markdown('<div class="section-title">⊙ Cambiar contraseña</div>', unsafe_allow_html=True)
     actual  = st.text_input("Contraseña actual",          type="password", key="pwd_actual")
@@ -1538,93 +1720,9 @@ def panel_password():
             mostrar_ok("Contraseña actualizada correctamente.")
 
 
-# ── Header ────────────────────────────────────────────────────────────────────
-hist = cargar()
-h0, h1, h2 = st.columns([0.35, 3, 1])
-with h0:
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.image("Claro-logo_1.png", width=70)
-with h1:
-    st.markdown("## 🖧 Red FTTH — Crecimiento")
-    if not hist.empty:
-        ultima     = hist["fecha_carga"].max()
-        ultima_str = ultima.strftime("%d %b %Y") if (ultima.hour == 0 and ultima.minute == 0) else ultima.strftime("%d %b %Y — %H:%M")
-    else:
-        ultima_str = "Sin datos"
-    st.markdown(f"<p style='color:rgba(255,255,255,0.35);font-size:12px;margin-top:-10px'>Última ejecución: {ultima_str}</p>", unsafe_allow_html=True)
-with h2:
-    if st.button("⟳ Actualizar datos"):
-        st.cache_data.clear()
-        st.rerun(scope="app")
-
-if not hist.empty:
-    ultima_nota = hist["fecha_carga"].max()
-    fn = ultima_nota.strftime("%d de %B de %Y a las %H:%M") if not (ultima_nota.hour == 0 and ultima_nota.minute == 0) else ultima_nota.strftime("%d de %B de %Y")
-    st.markdown(f"""<div class="nota"><div class="nota-texto">
-        ≡ Los valores reportados corresponden únicamente a equipos activos y operativos en la red residencial FTTH
-        a <span class="nota-fecha">{fn}</span>.
-        Esta fecha y hora corresponde al momento de ejecución y depuración de los scripts de procesamiento.
-    </div></div>""", unsafe_allow_html=True)
-
-st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-
-# ── Pestañas ──────────────────────────────────────────────────────────────────
-t0, t1, t2, t3, t4, t5 = st.tabs(["⎔ General","⊞ ZTE","⊞ Huawei","⊞ ATP","⊞ ONNET","⚙ Administrador"])
-
-with t0:
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-    if not hist.empty:
-        ultimos         = hist.sort_values("fecha_carga").groupby("vendor").last().reset_index()
-        total_olts      = int(ultimos["total_olts"].sum())
-        total_troncales = int(ultimos["total_troncales"].sum())
-        total_onts      = int(ultimos["total_onts"].sum())
-        st.markdown("#### ⎔ Total Red")
-        tc1, tc2, tc3 = st.columns(3)
-        with tc1:
-            st.markdown(f'<div class="mcard" style="border-color:#f6ad5544"><div class="mlabel" style="color:#f6ad55">⬡ Total OLTs</div><div class="mval">{total_olts:,}</div></div>', unsafe_allow_html=True)
-        with tc2:
-            st.markdown(f'<div class="mcard" style="border-color:#68d39144"><div class="mlabel" style="color:#68d391">◉ Total Troncales</div><div class="mval">{total_troncales:,}</div></div>', unsafe_allow_html=True)
-        with tc3:
-            st.markdown(f'<div class="mcard" style="border-color:#63b3ed44"><div class="mlabel" style="color:#63b3ed">▲ Total ONTs</div><div class="mval">{total_onts:,}</div></div>', unsafe_allow_html=True)
-        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-        st.markdown("#### Por vendor")
-    cols = st.columns(4)
-    for i, vendor in enumerate(["ZTE","HAW","ATP","ONNET"]):
-        c_onts, c_tronc, c_olts = COLORES[vendor]
-        with cols[i]:
-            df_v = hist[hist["vendor"] == vendor] if not hist.empty else pd.DataFrame(columns=COLS)
-            if not df_v.empty:
-                u = df_v.iloc[-1]
-                st.markdown(f'''<div class="mcard" style="border-color:{c_onts}44">
-                    <div class="mlabel" style="color:{c_onts}">{VENDOR_NOMBRE.get(vendor, vendor)}</div>
-                    <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:8px">⎕ OLTs</div>
-                    <div style="font-size:20px;font-weight:600;color:#fff">{int(u["total_olts"]):,}</div>
-                    <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:6px">⏛ Troncales</div>
-                    <div style="font-size:20px;font-weight:600;color:#fff">{int(u["total_troncales"]):,}</div>
-                    <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:6px">⏣ ONTs</div>
-                    <div style="font-size:20px;font-weight:600;color:#fff">{int(u["total_onts"]):,}</div>
-                </div>''', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="mcard" style="border-color:rgba(255,255,255,0.08)"><div class="mlabel" style="color:rgba(255,255,255,0.25)">{VENDOR_NOMBRE.get(vendor, vendor)}</div><div style="font-size:13px;color:rgba(255,255,255,0.2);margin-top:20px">⊜ Pendiente</div></div>', unsafe_allow_html=True)
-
-with t1:
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-    vista("ZTE", hist)
-
-with t2:
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-    vista("HAW", hist)
-
-with t3:
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-    vista("ATP", hist)
-
-with t4:
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-    vista("ONNET", hist)
-
-with t5:
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+@st.dialog("⚙ Panel de Administrador")
+def dialogo_admin():
+    st.session_state["admin_dialog_open"] = True
 
     if not st.session_state.admin_logged:
         st.markdown("#### ⊡ Acceso Administrador")
@@ -1661,7 +1759,8 @@ with t5:
             st.markdown("#### ⚙ Panel de Administrador")
         with col_s:
             if st.button("↩ Cerrar sesión", key="btn_logout"):
-                st.session_state.admin_logged = False
+                st.session_state.admin_logged      = False
+                st.session_state["admin_dialog_open"] = False
                 st.rerun(scope="app")
 
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
@@ -1676,5 +1775,123 @@ with t5:
             panel_onnet()
 
         st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+        with st.expander("⊙ Notas"):
+            panel_notas()
+
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
         with st.expander("⊙ Cambiar contraseña"):
             panel_password()
+
+
+# ── Notas públicas (solo lectura) ────────────────────────────────────────────
+def mostrar_notas_publicas(vendor_tag):
+    df_notas = cargar_notas()
+    sub = df_notas[df_notas["vendor"] == vendor_tag].sort_values("fecha", ascending=False) if not df_notas.empty else df_notas
+    if sub.empty:
+        return
+    with st.expander(f"📌 Notas ({len(sub)})"):
+        for _, row in sub.iterrows():
+            texto_html = html.escape(str(row["texto"])).replace("\n", "<br>")
+            st.markdown(
+                f'<div class="nota"><div class="nota-texto">{texto_html}<br>'
+                f'<span style="color:rgba(255,255,255,0.35);font-size:11px">{row["fecha"]}</span></div></div>',
+                unsafe_allow_html=True,
+            )
+
+
+# ── Header ────────────────────────────────────────────────────────────────────
+hist = cargar()
+
+h1, h2, h3 = st.columns([3, 1, 0.3])
+with h1:
+    st.markdown("## 🖧 Red FTTH — Crecimiento")
+    if not hist.empty:
+        ultima     = hist["fecha_carga"].max()
+        ultima_str = ultima.strftime("%d %b %Y") if (ultima.hour == 0 and ultima.minute == 0) else ultima.strftime("%d %b %Y — %H:%M")
+    else:
+        ultima_str = "Sin datos"
+    st.markdown(f"<p style='color:rgba(255,255,255,0.35);font-size:12px;margin-top:-10px'>Última ejecución: {ultima_str}</p>", unsafe_allow_html=True)
+with h2:
+    if st.button("⟳ Actualizar datos"):
+        st.cache_data.clear()
+        st.rerun(scope="app")
+with h3:
+    if st.button("⚙", key="btn_abrir_admin", help="Panel de administrador"):
+        st.session_state["admin_dialog_open"] = True
+
+# Abre (o reabre tras cualquier rerun: login, publicar, nuevo procesamiento, etc.)
+# el diálogo de admin mientras la bandera siga activa, para que no se sienta
+# como que "te saca" del panel.
+if st.session_state.get("admin_dialog_open", False):
+    dialogo_admin()
+
+if not hist.empty:
+    ultima_nota = hist["fecha_carga"].max()
+    fn = ultima_nota.strftime("%d de %B de %Y a las %H:%M") if not (ultima_nota.hour == 0 and ultima_nota.minute == 0) else ultima_nota.strftime("%d de %B de %Y")
+    st.markdown(f"""<div class="nota"><div class="nota-texto">
+        ≡ Los valores reportados corresponden únicamente a equipos activos y operativos en la red residencial FTTH
+        a <span class="nota-fecha">{fn}</span>.
+        Esta fecha y hora corresponde al momento de ejecución y depuración de los scripts de procesamiento.
+    </div></div>""", unsafe_allow_html=True)
+
+st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+# ── Pestañas ──────────────────────────────────────────────────────────────────
+t0, t1, t2, t3, t4 = st.tabs(["⎔ General","⊞ ZTE","⊞ Huawei","⊞ ATP","⊞ ONNET"])
+
+with t0:
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+    mostrar_notas_publicas("GENERAL")
+    if not hist.empty:
+        ultimos         = hist.sort_values("fecha_carga").groupby("vendor").last().reset_index()
+        total_olts      = int(ultimos["total_olts"].sum())
+        total_troncales = int(ultimos["total_troncales"].sum())
+        total_onts      = int(ultimos["total_onts"].sum())
+        st.markdown("#### ⎔ Total Red")
+        tc1, tc2, tc3 = st.columns(3)
+        with tc1:
+            st.markdown(f'<div class="mcard" style="border-color:#f6ad5544"><div class="mlabel" style="color:#f6ad55">⬡ Total OLTs</div><div class="mval">{total_olts:,}</div></div>', unsafe_allow_html=True)
+        with tc2:
+            st.markdown(f'<div class="mcard" style="border-color:#68d39144"><div class="mlabel" style="color:#68d391">◉ Total Troncales</div><div class="mval">{total_troncales:,}</div></div>', unsafe_allow_html=True)
+        with tc3:
+            st.markdown(f'<div class="mcard" style="border-color:#63b3ed44"><div class="mlabel" style="color:#63b3ed">▲ Total ONTs</div><div class="mval">{total_onts:,}</div></div>', unsafe_allow_html=True)
+        st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        st.markdown("#### Por vendor")
+    cols = st.columns(4)
+    for i, vendor in enumerate(["ZTE","HAW","ATP","ONNET"]):
+        c_onts, c_tronc, c_olts = COLORES[vendor]
+        with cols[i]:
+            df_v = hist[hist["vendor"] == vendor] if not hist.empty else pd.DataFrame(columns=COLS)
+            if not df_v.empty:
+                u = df_v.iloc[-1]
+                st.markdown(f'''<div class="mcard" style="border-color:{c_onts}44">
+                    <div class="mlabel" style="color:{c_onts}">{VENDOR_NOMBRE.get(vendor, vendor)}</div>
+                    <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:8px">⎕ OLTs</div>
+                    <div style="font-size:20px;font-weight:600;color:#fff">{int(u["total_olts"]):,}</div>
+                    <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:6px">⏛ Troncales</div>
+                    <div style="font-size:20px;font-weight:600;color:#fff">{int(u["total_troncales"]):,}</div>
+                    <div style="font-size:11px;color:rgba(255,255,255,0.4);margin-top:6px">⏣ ONTs</div>
+                    <div style="font-size:20px;font-weight:600;color:#fff">{int(u["total_onts"]):,}</div>
+                </div>''', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="mcard" style="border-color:rgba(255,255,255,0.08)"><div class="mlabel" style="color:rgba(255,255,255,0.25)">{VENDOR_NOMBRE.get(vendor, vendor)}</div><div style="font-size:13px;color:rgba(255,255,255,0.2);margin-top:20px">⊜ Pendiente</div></div>', unsafe_allow_html=True)
+
+with t1:
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+    mostrar_notas_publicas("ZTE")
+    vista("ZTE", hist)
+
+with t2:
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+    mostrar_notas_publicas("HAW")
+    vista("HAW", hist)
+
+with t3:
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+    mostrar_notas_publicas("ATP")
+    vista("ATP", hist)
+
+with t4:
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+    mostrar_notas_publicas("ONNET")
+    vista("ONNET", hist)

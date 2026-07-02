@@ -31,6 +31,31 @@ try {
 </script>
 """, height=0)
 
+# ── Fix: doble clic selecciona todo el texto en los buscadores (selectbox) ──
+# Por defecto, el doble clic en un input solo selecciona una "palabra" (se
+# corta en espacios, guiones, guiones bajos, etc.). En buscadores como el de
+# "Selecciona una OLT", los nombres suelen tener guiones (ej. ZAC-BOG-01), así
+# que el doble clic no seleccionaba el nombre completo y había que borrar todo
+# a mano antes de pegar uno nuevo. Este parche fuerza que el doble clic
+# seleccione TODO el contenido del campo, para poder pegar directamente encima.
+components.html("""
+<script>
+try {
+    var w = window.parent;
+    if (w && !w.__dblClickSelectPatched) {
+        w.document.addEventListener('dblclick', function(e) {
+            var el = e.target;
+            if (el && el.tagName === 'INPUT' && el.closest('div[data-baseweb="select"]')) {
+                e.preventDefault();
+                el.select();
+            }
+        }, true);
+        w.__dblClickSelectPatched = true;
+    }
+} catch(e) {}
+</script>
+""", height=0)
+
 ENV_PATH = ".env"
 DATA_DIR = "data"
 TEMP_DIR = os.path.join(DATA_DIR, "temp")
@@ -163,6 +188,10 @@ for k, v in {
     "publicado_haw":   False,
     "publicado_onnet": False,
     "confirmar_borrado_nota": None,
+    "editor_logged":         False,
+    "editor_dialog_open":    False,
+    "editor_login_attempts": 0,
+    "editor_lockout_until":  None,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -274,13 +303,6 @@ def vista(vendor, hist):
     ultimo   = df.iloc[-1]
     anterior = df.iloc[-2] if len(df) > 1 else None
 
-    st.markdown(
-        '<div class="warn-box"><div class="warn-text">⚠ Esta información corresponde '
-        'al estado puntual de la red al momento del procesamiento de las bases y puede '
-        'variar según el estado de los equipos al momento de la consulta. Cifras en cero '
-        'pueden deberse a equipos temporalmente offline.</div></div>',
-        unsafe_allow_html=True)
-
     c1, c2, c3 = st.columns(3)
     with c1:
         delta = int(ultimo["total_olts"] - anterior["total_olts"]) if anterior is not None else None
@@ -291,6 +313,7 @@ def vista(vendor, hist):
     with c3:
         delta = int(ultimo["total_onts"] - anterior["total_onts"]) if anterior is not None else None
         tarjeta("⏣ ONTs activas", ultimo["total_onts"], delta, c_onts)
+
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
     if len(df) > 1:
         g1, g2, g3 = st.columns(3)
@@ -379,6 +402,13 @@ def detalle_por_olt(vendor):
             f'<div class="mlabel" style="color:{c_onts}">⏣ ONTs</div>'
             f'<div class="mval" style="font-size:22px">{total_onts:,}</div></div>',
             unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="warn-box"><div class="warn-text">⚠ Esta información corresponde '
+        'al estado puntual de la red al momento del procesamiento de las bases y puede '
+        'variar según el estado de los equipos al momento de la consulta. Cifras en cero '
+        'pueden deberse a equipos temporalmente offline.</div></div>',
+        unsafe_allow_html=True)
 
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
@@ -530,6 +560,23 @@ def leer_excel_seguro(archivo, columnas, sheet=None, conservar_na_texto=False):
 
 def validar_metricas(m):
     return [k.replace("total_", "") for k in ["total_olts","total_troncales","total_onts"] if m.get(k, 0) == 0]
+
+def validar_historico_editado(df):
+    errores = []
+    if df.empty:
+        return errores
+    if df["fecha_carga"].isna().any():
+        errores.append("Hay filas con fecha de carga vacía.")
+    fechas_validas = df["fecha_carga"].dropna()
+    if fechas_validas.duplicated().any():
+        dups = fechas_validas[fechas_validas.duplicated()].dt.strftime("%Y-%m-%d %H:%M").tolist()
+        errores.append(f"Hay fechas de carga duplicadas: {', '.join(dups)}")
+    for col, lbl in [("total_olts","OLTs"), ("total_troncales","Troncales"), ("total_onts","ONTs")]:
+        if df[col].isna().any():
+            errores.append(f"Hay valores vacíos en '{lbl}'.")
+        elif (df[col] < 0).any():
+            errores.append(f"Hay valores negativos en '{lbl}'.")
+    return errores
 
 def csv_bytes(df):
     buf = io.BytesIO()
@@ -760,13 +807,26 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
     log += [reg(r, "Operational Status", "Estado no es Online") for _, r in onts[m].iterrows()]
     onts = onts[~m].copy()
 
-    # R6 ONU Name serial
+    # R6 ONU Name debe iniciar con un prefijo válido
     patron = "^(" + "|".join(PREFIJOS_SERIAL) + ")"
     onu_str = onts["ONU Name"].astype(str).str.strip()
     m = onts["ONU Name"].isna() | (~onu_str.str.match(patron))
     m_log = (~onts["ONU Name"].isna()) & (onu_str != "") & (~onu_str.str.match(patron))
     log += [reg(r, "ONU Name", "Serial no inicia con prefijo valido (ZTE/SKY/SDM/SCO/HWT/SEI)") for _, r in onts[m_log].iterrows()]
-    onts_dep = onts[~m].copy()
+    onts_d6 = onts[~m].copy()
+
+    # R6b ONU Name debe tener exactamente 12 caracteres alfanuméricos (sin espacios/símbolos)
+    onu_str_d6   = onts_d6["ONU Name"].astype(str).str.strip()
+    mask_formato = ~onu_str_d6.str.match(r"^[A-Za-z0-9]{12}$")
+    if mask_formato.any():
+        for _, r in onts_d6[mask_formato].iterrows():
+            valor = str(r["ONU Name"]).strip()
+            if len(valor) != 12:
+                motivo = f"Longitud inválida ({len(valor)} caracteres, se requieren 12)"
+            else:
+                motivo = "Contiene espacios o caracteres no alfanuméricos"
+            log.append(reg(r, "ONU Name", motivo))
+    onts_dep = onts_d6[~mask_formato].copy()
     avanzar(f"ONTs depuradas: {len(onts_dep):,} válidas de {n_inicio:,}")
 
     # ── Leer Troncales ──
@@ -1720,7 +1780,7 @@ def panel_password():
             mostrar_ok("Contraseña actualizada correctamente.")
 
 
-@st.dialog("⚙ Panel de Administrador")
+@st.dialog("⚙ Panel de Administrador", width="medium")
 def dialogo_admin():
     st.session_state["admin_dialog_open"] = True
 
@@ -1783,6 +1843,127 @@ def dialogo_admin():
             panel_password()
 
 
+@st.fragment
+def panel_editor_historicos():
+    st.markdown('<div class="section-title">🗄 Editar histórico</div>', unsafe_allow_html=True)
+
+    vendor_sel = st.selectbox(
+        "Vendor", ["ZTE", "HAW", "ATP", "ONNET"],
+        format_func=lambda v: VENDOR_NOMBRE.get(v, v), key="editor_vendor_select",
+    )
+
+    ruta = os.path.join(DATA_DIR, f"historico_{vendor_sel}.csv")
+    if os.path.exists(ruta):
+        df = pd.read_csv(ruta)
+        if "fecha_carga" in df.columns:
+            df["fecha_carga"] = pd.to_datetime(df["fecha_carga"], format="mixed", errors="coerce")
+        for col in ["total_olts", "total_troncales", "total_onts"]:
+            if col not in df.columns:
+                df[col] = pd.NA
+        df = df[["fecha_carga", "total_olts", "total_troncales", "total_onts"]]
+    else:
+        df = pd.DataFrame(columns=["fecha_carga", "total_olts", "total_troncales", "total_onts"])
+
+    df = df.sort_values("fecha_carga").reset_index(drop=True)
+
+    st.markdown(
+        '<div class="nota"><div class="nota-texto">Puedes editar valores, borrar filas (selecciona la fila y '
+        'presiona la papelera) o agregar filas nuevas con el botón "+" al final de la tabla.</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    df_editado = st.data_editor(
+        df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key=f"editor_hist_{vendor_sel}",
+        column_config={
+            "fecha_carga": st.column_config.DatetimeColumn(
+                "Fecha de carga", format="YYYY-MM-DD HH:mm", step=60, required=True,
+            ),
+            "total_olts": st.column_config.NumberColumn(
+                "OLTs", min_value=0, step=1, format="%d", required=True,
+            ),
+            "total_troncales": st.column_config.NumberColumn(
+                "Troncales", min_value=0, step=1, format="%d", required=True,
+            ),
+            "total_onts": st.column_config.NumberColumn(
+                "ONTs", min_value=0, step=1, format="%d", required=True,
+            ),
+        },
+    )
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    if st.button("💾 Guardar cambios", key=f"btn_guardar_editor_{vendor_sel}", type="primary"):
+        errores = validar_historico_editado(df_editado)
+        if errores:
+            for e in errores:
+                mostrar_error(e)
+        else:
+            df_final = df_editado.dropna(subset=["fecha_carga"]).sort_values("fecha_carga").copy()
+            df_final.insert(0, "vendor", vendor_sel)
+            df_final["fecha_carga"] = df_final["fecha_carga"].dt.strftime("%Y-%m-%d %H:%M")
+            for col in ["total_olts", "total_troncales", "total_onts"]:
+                df_final[col] = df_final[col].astype(int)
+            df_final.to_csv(ruta, index=False)
+            st.cache_data.clear()
+            mostrar_ok(f"Histórico de {VENDOR_NOMBRE.get(vendor_sel, vendor_sel)} actualizado.")
+            st.rerun(scope="app")
+
+
+@st.dialog("🗄 Editor de Históricos", width="medium")
+def dialogo_editor_historicos():
+    st.session_state["editor_dialog_open"] = True
+
+    if not st.session_state.editor_logged:
+        st.markdown("#### ⊡ Acceso Editor de Históricos")
+        st.markdown(
+            '<div class="nota"><div class="nota-texto">Este acceso es independiente del panel de '
+            'administrador. Requiere la contraseña de administrador nuevamente.</div></div>',
+            unsafe_allow_html=True,
+        )
+
+        if st.session_state.editor_lockout_until:
+            restante = (st.session_state.editor_lockout_until - datetime.now()).total_seconds()
+            if restante > 0:
+                mostrar_error(f"Demasiados intentos fallidos. Espera {int(restante)} segundos.")
+                st.stop()
+            else:
+                st.session_state.editor_lockout_until  = None
+                st.session_state.editor_login_attempts  = 0
+
+        pwd = st.text_input("", type="password", key="pwd_login_editor",
+                            placeholder="Ingresa la contraseña de administrador")
+        col_btn, _ = st.columns([1, 3])
+        with col_btn:
+            if st.button("Ingresar", key="btn_login_editor", type="primary"):
+                if verificar_password(pwd):
+                    st.session_state.editor_logged         = True
+                    st.session_state.editor_login_attempts = 0
+                    st.rerun(scope="app")
+                else:
+                    st.session_state.editor_login_attempts += 1
+                    restantes = 3 - st.session_state.editor_login_attempts
+                    if st.session_state.editor_login_attempts >= 3:
+                        st.session_state.editor_lockout_until = datetime.now() + timedelta(minutes=5)
+                        mostrar_error("Demasiados intentos. Bloqueado por 5 minutos.")
+                    else:
+                        mostrar_error(f"Contraseña incorrecta. {restantes} intento(s) restante(s).")
+    else:
+        col_t, col_s = st.columns([4, 1])
+        with col_t:
+            st.markdown("#### 🗄 Editor de Históricos")
+        with col_s:
+            if st.button("↩ Cerrar sesión", key="btn_logout_editor"):
+                st.session_state.editor_logged      = False
+                st.session_state["editor_dialog_open"] = False
+                st.rerun(scope="app")
+
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        panel_editor_historicos()
+
+
 # ── Notas públicas (solo lectura) ────────────────────────────────────────────
 def mostrar_notas_publicas(vendor_tag):
     df_notas = cargar_notas()
@@ -1802,10 +1983,10 @@ def mostrar_notas_publicas(vendor_tag):
 # ── Header ────────────────────────────────────────────────────────────────────
 hist = cargar()
 
-h0, h1, h2, h3 = st.columns([0.35, 3, 1, 0.3])
+h0, h1, h2, h3, h4 = st.columns([0.35, 3, 1, 0.3, 0.3])
 
 with h0:
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
     st.image("Claro-logo_1.png", width=70)
 
 with h1:
@@ -1823,12 +2004,17 @@ with h2:
 with h3:
     if st.button("⚙", key="btn_abrir_admin", help="Panel de administrador"):
         st.session_state["admin_dialog_open"] = True
+with h4:
+    if st.button("🗄", key="btn_abrir_editor", help="Editor de históricos"):
+        st.session_state["editor_dialog_open"] = True
 
 # Abre (o reabre tras cualquier rerun: login, publicar, nuevo procesamiento, etc.)
-# el diálogo de admin mientras la bandera siga activa, para que no se sienta
-# como que "te saca" del panel.
+# los diálogos mientras sus banderas sigan activas, para que no se sienta
+# como que "te sacan" del panel.
 if st.session_state.get("admin_dialog_open", False):
     dialogo_admin()
+if st.session_state.get("editor_dialog_open", False):
+    dialogo_editor_historicos()
 
 if not hist.empty:
     ultima_nota = hist["fecha_carga"].max()

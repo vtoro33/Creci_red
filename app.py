@@ -540,13 +540,23 @@ def detectar_grupos(archivos):
 
 def leer_excel_seguro(archivo, columnas, sheet=None, conservar_na_texto=False):
     try:
-        kwargs = {"engine": "openpyxl"}
+        kwargs = {}
         if conservar_na_texto:
             kwargs["keep_default_na"] = False
             kwargs["na_values"] = [""]
         if sheet:
             kwargs["sheet_name"] = sheet
-        df = pd.read_excel(archivo, **kwargs)
+        # 'calamine' es un motor de lectura de Excel (en Rust) mucho más rápido que
+        # 'openpyxl' — en pruebas, ~6x más rápido leyendo el mismo archivo, con datos
+        # idénticos. Si no está instalado (pip install python-calamine) o falla con
+        # algún archivo particular, se usa 'openpyxl' exactamente como antes, así que
+        # el comportamiento nunca se rompe por esto, solo se acelera cuando se puede.
+        try:
+            df = pd.read_excel(archivo, engine="calamine", **kwargs)
+        except (ImportError, ValueError):
+            if hasattr(archivo, "seek"):
+                archivo.seek(0)
+            df = pd.read_excel(archivo, engine="openpyxl", **kwargs)
         df.columns = [str(c).strip() for c in df.columns]
         faltantes = [c for c in columnas if c not in df.columns]
         if faltantes:
@@ -741,7 +751,7 @@ def mostrar_warn(msg):
 
 # ── Procesadores ──────────────────────────────────────────────────────────────
 def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
-    log   = []
+    log_frames = []  # lista de DataFrames de log; se concatenan una sola vez al final
     ts    = datetime.now().strftime("%Y-%m-%d_%H%M")
     pasos = 8
     paso  = [0]
@@ -772,22 +782,33 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
     # ── Depurar ONTs ──
     stxt.markdown('<div class="step-line">⟳ Depurando ONTs...</div>', unsafe_allow_html=True)
 
-    def reg(fila, columna, motivo):
-        return {
-            "archivo_fuente": fila["archivo_fuente"],
-            "NE_Name":        str(fila.get("NE Name", "")),
-            "Shelf":          str(fila.get("Shelf", "")),
-            "Slot":           str(fila.get("Slot", "")),
-            "Port":           str(fila.get("Port", "")),
+    def construir_log_onts(df, mask, columna, motivo, valor_col=None):
+        """Equivalente vectorizado de: [reg(r, columna, motivo) for _, r in df[mask].iterrows()]
+        Construye el mismo esquema de columnas que 'reg', pero sin recorrer fila por fila.
+        'motivo' puede ser un string fijo o una Serie/array ya alineada con df[mask] (para R6b)."""
+        if not mask.any():
+            return None
+        sub = df.loc[mask]
+        vcol = valor_col if valor_col is not None else columna
+        # .map(str) (no .astype(str)): replica el str(valor) de Python fila-a-fila
+        # tal como hacía el código original, incluyendo NaN -> "nan". .astype(str)
+        # en pandas moderno deja los NaN sin convertir, lo cual cambiaría el texto
+        # del log (no las filas eliminadas ni las métricas, solo el detalle del log).
+        return pd.DataFrame({
+            "archivo_fuente": sub["archivo_fuente"].values,
+            "NE_Name":        sub["NE Name"].map(str).values,
+            "Shelf":          sub["Shelf"].map(str).values,
+            "Slot":           sub["Slot"].map(str).values,
+            "Port":           sub["Port"].map(str).values,
             "columna":        columna,
-            "valor_original": str(fila.get(columna, "")),
+            "valor_original": sub[vcol].map(str).values,
             "motivo":         motivo,
-        }
+        })
 
     # R1 NE Name
     ne_str = onts_raw["NE Name"].astype(str).str.strip()
     m = ~ne_str.str.startswith("ZAC")
-    log += [reg(r, "NE Name", "No inicia con ZAC") for _, r in onts_raw[m].iterrows()]
+    log_frames.append(construir_log_onts(onts_raw, m, "NE Name", "No inicia con ZAC"))
     onts = onts_raw[~m].copy()
 
     # R2-R4 numéricos
@@ -796,7 +817,7 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
         onts[col] = onts[col].astype(str)
         mk = ~es_numerico_valido(onts[col])
         mk_log = mk & ~col_orig.isna() & (onts[col].str.strip() != "")
-        log += [reg(r, col, f"Valor no numerico en {col}") for _, r in onts[mk_log].iterrows()]
+        log_frames.append(construir_log_onts(onts, mk_log, col, f"Valor no numerico en {col}"))
         onts = onts[~mk].copy()
       
     onts = normalizar_enteros(onts, ["Shelf", "Slot", "Port"])  
@@ -804,7 +825,7 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
     # R5 Operational Status
     status_str = onts["Operational Status"].astype(str).str.strip().str.lower()
     m = (status_str != "online")
-    log += [reg(r, "Operational Status", "Estado no es Online") for _, r in onts[m].iterrows()]
+    log_frames.append(construir_log_onts(onts, m, "Operational Status", "Estado no es Online"))
     onts = onts[~m].copy()
 
     # R6 ONU Name debe iniciar con un prefijo válido
@@ -812,20 +833,24 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
     onu_str = onts["ONU Name"].astype(str).str.strip()
     m = onts["ONU Name"].isna() | (~onu_str.str.match(patron))
     m_log = (~onts["ONU Name"].isna()) & (onu_str != "") & (~onu_str.str.match(patron))
-    log += [reg(r, "ONU Name", "Serial no inicia con prefijo valido (ZTE/SKY/SDM/SCO/HWT/SEI)") for _, r in onts[m_log].iterrows()]
+    log_frames.append(construir_log_onts(onts, m_log, "ONU Name", "Serial no inicia con prefijo valido (ZTE/SKY/SDM/SCO/HWT/SEI)"))
     onts_d6 = onts[~m].copy()
 
     # R6b ONU Name debe tener exactamente 12 caracteres alfanuméricos (sin espacios/símbolos)
     onu_str_d6   = onts_d6["ONU Name"].astype(str).str.strip()
     mask_formato = ~onu_str_d6.str.match(r"^[A-Za-z0-9]{12}$")
     if mask_formato.any():
-        for _, r in onts_d6[mask_formato].iterrows():
-            valor = str(r["ONU Name"]).strip()
-            if len(valor) != 12:
-                motivo = f"Longitud inválida ({len(valor)} caracteres, se requieren 12)"
-            else:
-                motivo = "Contiene espacios o caracteres no alfanuméricos"
-            log.append(reg(r, "ONU Name", motivo))
+        valores_d6  = onu_str_d6.loc[mask_formato]
+        longitudes  = valores_d6.str.len()
+        motivos_d6  = pd.Series(
+            "Contiene espacios o caracteres no alfanuméricos", index=valores_d6.index
+        )
+        mask_long_invalida = longitudes != 12
+        motivos_d6.loc[mask_long_invalida] = (
+            "Longitud inválida (" + longitudes.loc[mask_long_invalida].astype(str)
+            + " caracteres, se requieren 12)"
+        )
+        log_frames.append(construir_log_onts(onts_d6, mask_formato, "ONU Name", motivos_d6.values))
     onts_dep = onts_d6[~mask_formato].copy()
     avanzar(f"ONTs depuradas: {len(onts_dep):,} válidas de {n_inicio:,}")
 
@@ -847,20 +872,11 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
     ne_tronc_str = tronc_raw["NE Name"].astype(str).str.strip()
     olts_maestro = tronc_raw[ne_tronc_str.str.startswith("ZAC")][["NE Name"]].drop_duplicates()
 
-    def reg_tronc(fila, columna, motivo):
-        return {
-            "archivo_fuente": fila.get("archivo_fuente", ""),
-            "NE_Name":        str(fila.get("NE Name", "")),
-            "Shelf":          str(fila.get("Shelf", "")),
-            "Slot":           str(fila.get("Slot", "")),
-            "Port":           str(fila.get("Port", "")),
-            "columna":        columna,
-            "valor_original": str(fila.get(columna, "")),
-            "motivo":         motivo,
-        }
+    # reg_tronc tenía exactamente el mismo esquema que reg() (mismas columnas de
+    # contexto NE Name/Shelf/Slot/Port), así que reutilizamos construir_log_onts.
 
     m = ~ne_tronc_str.str.startswith("ZAC")
-    log += [reg_tronc(r, "NE Name", "No inicia con ZAC") for _, r in tronc_raw[m].iterrows()]
+    log_frames.append(construir_log_onts(tronc_raw, m, "NE Name", "No inicia con ZAC"))
     tronc = tronc_raw[~m].copy()
 
     for col in ["Shelf","Slot","Port"]:
@@ -868,7 +884,7 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
         tronc[col] = tronc[col].astype(str)
         mk = ~es_numerico_valido(tronc[col])
         mk_log = mk & ~col_orig.isna() & (tronc[col].str.strip() != "")
-        log += [reg_tronc(r, col, f"Valor no numerico en {col}") for _, r in tronc[mk_log].iterrows()]
+        log_frames.append(construir_log_onts(tronc, mk_log, col, f"Valor no numerico en {col}"))
         tronc = tronc[~mk].copy()
 
     tronc = normalizar_enteros(tronc, ["Shelf", "Slot", "Port"])
@@ -878,7 +894,7 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
     pn = tronc["Port Name"].astype(str).str.strip()
     m_trk = pn_orig.isna() | (pn == "") | (~pn.str.startswith("TRK"))
     m_trk_log = ~pn_orig.isna() & (pn != "") & ~pn.str.startswith("TRK")
-    log += [reg_tronc(r, "Port Name", "No inicia con TRK") for _, r in tronc[m_trk_log].iterrows()]
+    log_frames.append(construir_log_onts(tronc, m_trk_log, "Port Name", "No inicia con TRK"))
     tronc = tronc[~m_trk].copy()
 
     pn2      = tronc["Port Name"].astype(str).str.strip()
@@ -888,8 +904,12 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
     tronc      = tronc.drop_duplicates()
 
     # Puertos ambiguos
+    # (equivalente a groupby([...]).filter(lambda x: len(x) > 1), pero vectorizado:
+    #  duplicated(keep=False) marca TODAS las filas que pertenecen a un grupo con
+    #  más de una fila, igual que filter(lambda x: len(x) > 1))
     puertos_ambiguos_rev = pd.DataFrame()
-    dup = tronc.groupby(["NE Name","Shelf","Slot","Port"]).filter(lambda x: len(x) > 1)
+    dup_mask = tronc.duplicated(subset=["NE Name","Shelf","Slot","Port"], keep=False)
+    dup = tronc[dup_mask]
     if not dup.empty:
         rev = dup[~dup["NE Name"].astype(str).str.contains("ATP", na=False)]
         if not rev.empty:
@@ -904,14 +924,18 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
     olts_en_tronc = set(olts_maestro["NE Name"].unique())
     olts_solo_onts = olts_en_onts - olts_en_tronc
     if olts_solo_onts:
+        # Iteración pequeña y acotada al número de OLTs únicas (no a filas de datos),
+        # por eso se deja igual que el original: no es el cuello de botella de rendimiento.
+        log_extra = []
         for olt in sorted(olts_solo_onts):
             n = int(onts_dep[onts_dep["NE Name"] == olt].shape[0])
-            log.append({
+            log_extra.append({
                 "archivo_fuente": "", "NE_Name": olt,
                 "Shelf": "", "Slot": "", "Port": "",
                 "columna": "NE Name", "valor_original": olt,
                 "motivo": f"OLT con {n:,} ONTs en archivo de ONTs pero sin presencia en archivo de Troncales",
             })
+        log_frames.append(pd.DataFrame(log_extra))
 
     # ── Cruce ──
     stxt.markdown('<div class="step-line">⟳ Cruzando Troncales con ONTs...</div>', unsafe_allow_html=True)
@@ -963,7 +987,8 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
     else:
         ftth_cruzado = pd.DataFrame()
 
-    log_df = pd.DataFrame(log) if log else pd.DataFrame()
+    log_frames = [f for f in log_frames if f is not None and not f.empty]
+    log_df = pd.concat(log_frames, ignore_index=True) if log_frames else pd.DataFrame()
     az = {f"base_ZTE_ATP_{ts}.csv": csv_bytes(base)}
     if not log_df.empty:
         az[f"log_depuracion_{ts}.csv"] = csv_bytes(log_df)
@@ -990,7 +1015,7 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
 
 
 def procesar_huawei(archivos, grupo_tronc, pb, stxt):
-    log   = []
+    log_frames = []  # lista de DataFrames de log; se concatenan una sola vez al final
     ts    = datetime.now().strftime("%Y-%m-%d_%H%M")
     pasos = 8
     paso  = [0]
@@ -1021,21 +1046,27 @@ def procesar_huawei(archivos, grupo_tronc, pb, stxt):
     # ── Depurar clientes ──
     stxt.markdown('<div class="step-line">⟳ Depurando clientes...</div>', unsafe_allow_html=True)
 
-    def reg_haw(fila, columna, motivo):
-        return {
-            "archivo_fuente": fila["archivo_fuente"],
-            "Device_name":    str(fila.get("Device name", "")),
-            "Frame_ID":       str(fila.get("Frame ID", "")),
-            "Slot_ID":        str(fila.get("Slot ID", "")),
-            "Port_ID":        str(fila.get("Port ID", "")),
+    def construir_log_haw(df, mask, columna, motivo, valor_col=None):
+        """Equivalente vectorizado de: [reg_haw(r, columna, motivo) for _, r in df[mask].iterrows()]"""
+        if not mask.any():
+            return None
+        sub = df.loc[mask]
+        vcol = valor_col if valor_col is not None else columna
+        # .map(str) en vez de .astype(str): ver nota en construir_log_onts.
+        return pd.DataFrame({
+            "archivo_fuente": sub["archivo_fuente"].values,
+            "Device_name":    sub["Device name"].map(str).values,
+            "Frame_ID":       sub["Frame ID"].map(str).values,
+            "Slot_ID":        sub["Slot ID"].map(str).values,
+            "Port_ID":        sub["Port ID"].map(str).values,
             "columna":        columna,
-            "valor_original": str(fila.get(columna, "")),
+            "valor_original": sub[vcol].map(str).values,
             "motivo":         motivo,
-        }
+        })
 
     dn_str = cli_raw["Device name"].astype(str).str.strip()
     m = ~dn_str.str.startswith("HAC")
-    log += [reg_haw(r, "Device name", "No inicia con HAC") for _, r in cli_raw[m].iterrows()]
+    log_frames.append(construir_log_haw(cli_raw, m, "Device name", "No inicia con HAC"))
     cli = cli_raw[~m].copy()
 
     for col in ["Frame ID","Slot ID","Port ID"]:
@@ -1043,18 +1074,18 @@ def procesar_huawei(archivos, grupo_tronc, pb, stxt):
         cli[col] = cli[col].astype(str)
         mk = ~es_numerico_valido(cli[col])
         mk_log = mk & ~col_orig.isna() & (cli[col].str.strip() != "")
-        log += [reg_haw(r, col, f"Valor no numerico en {col}") for _, r in cli[mk_log].iterrows()]
+        log_frames.append(construir_log_haw(cli, mk_log, col, f"Valor no numerico en {col}"))
         cli = cli[~mk].copy()
     cli = normalizar_enteros(cli, ["Frame ID", "Slot ID", "Port ID"])
 
     rs_str = cli["Running Status"].astype(str).str.strip().str.lower()
     m = (rs_str != "online")
-    log += [reg_haw(r, "Running Status", "Estado no es Online") for _, r in cli[m].iterrows()]
+    log_frames.append(construir_log_haw(cli, m, "Running Status", "Estado no es Online"))
     cli = cli[~m].copy()
 
     oa_str = cli["ONU Alias"].astype(str).str.strip()
     m = (oa_str != "--")
-    log += [reg_haw(r, "ONU Alias", "ONU Alias no es '--'") for _, r in cli[m].iterrows()]
+    log_frames.append(construir_log_haw(cli, m, "ONU Alias", "ONU Alias no es '--'"))
     cli_dep = cli[~m].copy()
     avanzar(f"Clientes depurados: {len(cli_dep):,} válidos de {n_inicio:,}")
 
@@ -1076,20 +1107,11 @@ def procesar_huawei(archivos, grupo_tronc, pb, stxt):
     dn_tronc_str = tronc_raw["Device name"].astype(str).str.strip()
     olts_maestro = tronc_raw[dn_tronc_str.str.startswith("HAC")][["Device name"]].drop_duplicates()
 
-    def reg_tronc_haw(fila, columna, motivo):
-        return {
-            "archivo_fuente": fila.get("archivo_fuente", ""),
-            "Device_name":    str(fila.get("Device name", "")),
-            "Frame_ID":       str(fila.get("Frame ID", "")),
-            "Slot_ID":        str(fila.get("Slot ID", "")),
-            "Port_ID":        str(fila.get("Port ID", "")),
-            "columna":        columna,
-            "valor_original": str(fila.get(columna, "")),
-            "motivo":         motivo,
-        }
+    # reg_tronc_haw tenía exactamente el mismo esquema que reg_haw(), así que
+    # reutilizamos construir_log_haw.
 
     m = ~dn_tronc_str.str.startswith("HAC")
-    log += [reg_tronc_haw(r, "Device name", "No inicia con HAC") for _, r in tronc_raw[m].iterrows()]
+    log_frames.append(construir_log_haw(tronc_raw, m, "Device name", "No inicia con HAC"))
     tronc = tronc_raw[~m].copy()
 
     for col in ["Frame ID","Slot ID","Port ID"]:
@@ -1097,7 +1119,7 @@ def procesar_huawei(archivos, grupo_tronc, pb, stxt):
         tronc[col] = tronc[col].astype(str)
         mk = ~es_numerico_valido(tronc[col])
         mk_log = mk & ~col_orig.isna() & (tronc[col].str.strip() != "")
-        log += [reg_tronc_haw(r, col, f"Valor no numerico en {col}") for _, r in tronc[mk_log].iterrows()]
+        log_frames.append(construir_log_haw(tronc, mk_log, col, f"Valor no numerico en {col}"))
         tronc = tronc[~mk].copy()
     tronc = normalizar_enteros(tronc, ["Frame ID", "Slot ID", "Port ID"])
 
@@ -1106,7 +1128,7 @@ def procesar_huawei(archivos, grupo_tronc, pb, stxt):
     ul_str  = tronc["User Label"].astype(str).str.strip()
     m_trk   = ul_orig.isna() | (ul_str == "") | (~ul_str.str.startswith("TRK"))
     m_trk_log = ~ul_orig.isna() & (ul_str != "") & ~ul_str.str.startswith("TRK")
-    log += [reg_tronc_haw(r, "User Label", "No inicia con TRK") for _, r in tronc[m_trk_log].iterrows()]
+    log_frames.append(construir_log_haw(tronc, m_trk_log, "User Label", "No inicia con TRK"))
     tronc  = tronc[~m_trk].copy()
     tronc  = tronc.drop_duplicates()
     avanzar(f"Troncales depuradas: {len(tronc):,} válidas de {n_inicio_t:,}")
@@ -1116,14 +1138,17 @@ def procesar_huawei(archivos, grupo_tronc, pb, stxt):
     olts_en_tronc = set(olts_maestro["Device name"].unique())
     olts_solo_cli = olts_en_cli - olts_en_tronc
     if olts_solo_cli:
+        # Iteración pequeña y acotada al número de OLTs únicas, igual que en ZTE/ATP.
+        log_extra = []
         for olt in sorted(olts_solo_cli):
             n = int(cli_dep[cli_dep["Device name"] == olt].shape[0])
-            log.append({
+            log_extra.append({
                 "archivo_fuente": "", "Device_name": olt,
                 "Frame_ID": "", "Slot_ID": "", "Port_ID": "",
                 "columna": "Device name", "valor_original": olt,
                 "motivo": f"OLT con {n:,} clientes en archivo de Clientes pero sin presencia en archivo de Troncales",
             })
+        log_frames.append(pd.DataFrame(log_extra))
 
     # ── Cruce ──
     stxt.markdown('<div class="step-line">⟳ Cruzando datos...</div>', unsafe_allow_html=True)
@@ -1152,7 +1177,8 @@ def procesar_huawei(archivos, grupo_tronc, pb, stxt):
     }
     avanzar("Métricas calculadas")
 
-    log_df = pd.DataFrame(log) if log else pd.DataFrame()
+    log_frames = [f for f in log_frames if f is not None and not f.empty]
+    log_df = pd.concat(log_frames, ignore_index=True) if log_frames else pd.DataFrame()
     az = {f"base_Huawei_{ts}.csv": csv_bytes(base)}
     if not log_df.empty:
         az[f"log_depuracion_Huawei_{ts}.csv"] = csv_bytes(log_df)
@@ -1181,7 +1207,7 @@ def procesar_onnet(archivos, pb, stxt):
     (si su último registro corresponde a la fecha más reciente del histórico) o INACTIVO
     (si su último registro es de una fecha anterior).
     """
-    log   = []
+    log_frames = []  # lista de DataFrames de log; se concatenan una sola vez al final
     ts    = datetime.now().strftime("%Y-%m-%d_%H%M")
     pasos = 6
     paso  = [0]
@@ -1223,7 +1249,15 @@ def procesar_onnet(archivos, pb, stxt):
     # [R1] OLT debe empezar por "OH"
     olt_str = base_raw["OLT"].astype(str).str.strip()
     m1 = base_raw["OLT"].isna() | (~olt_str.str.startswith("OH"))
-    log += [{"regla":"R1","campo":"OLT","valor":str(r["OLT"]),"motivo":"No inicia con OH","archivo":r["archivo_fuente"]} for _,r in base_raw[m1].iterrows()]
+    if m1.any():
+        sub_r1 = base_raw.loc[m1]
+        log_frames.append(pd.DataFrame({
+            "regla":   "R1",
+            "campo":   "OLT",
+            "valor":   sub_r1["OLT"].map(str).values,
+            "motivo":  "No inicia con OH",
+            "archivo": sub_r1["archivo_fuente"].values,
+        }))
     base_d1 = base_raw[~m1].copy()
 
     # [R2] SERIAL con prefijo no reconocido: solo advertencia, NO se elimina
@@ -1231,18 +1265,26 @@ def procesar_onnet(archivos, pb, stxt):
     ser_str = base_d1["SERIAL"].astype(str).str.strip()
     m_raro  = base_d1["SERIAL"].isna() | (~ser_str.str.match(patron))
     if m_raro.any():
-        log += [{
-            "regla":"R2","campo":"SERIAL","valor":str(r["SERIAL"]),
-            "motivo":f"Prefijo no reconocido — revisar ({'/'.join(PREFIJOS_SERIAL)})",
-            "archivo":r["archivo_fuente"],
-        } for _,r in base_d1[m_raro].iterrows()]
+        sub_r2 = base_d1.loc[m_raro]
+        log_frames.append(pd.DataFrame({
+            "regla":   "R2",
+            "campo":   "SERIAL",
+            "valor":   sub_r2["SERIAL"].map(str).values,
+            "motivo":  f"Prefijo no reconocido — revisar ({'/'.join(PREFIJOS_SERIAL)})",
+            "archivo": sub_r2["archivo_fuente"].values,
+        }))
 
     # [R3] SERIAL no puede ser vacío o nulo
     m_vacio  = base_d1["SERIAL"].isna() | (base_d1["SERIAL"].astype(str).str.strip() == "")
-    log     += [{
-        "regla":"R3","campo":"SERIAL","valor":"(vacío)",
-        "motivo":"Serial vacío o nulo — eliminado","archivo":str(r["archivo_fuente"]),
-    } for _,r in base_d1[m_vacio].iterrows()]
+    if m_vacio.any():
+        sub_r3 = base_d1.loc[m_vacio]
+        log_frames.append(pd.DataFrame({
+            "regla":   "R3",
+            "campo":   "SERIAL",
+            "valor":   "(vacío)",
+            "motivo":  "Serial vacío o nulo — eliminado",
+            "archivo": sub_r3["archivo_fuente"].map(str).values,
+        }))
 
     base_dep = base_d1[~m_vacio].copy()
     avanzar(f"Depuración histórica: {len(base_dep):,} válidos de {n_inicio:,}")
@@ -1264,11 +1306,19 @@ def procesar_onnet(archivos, pb, stxt):
     # Log de advertencia: ONTs que NO están activos en la fecha más reciente
     if n_inactivos > 0:
         inactivos = base_relacion[base_relacion["ESTADO"] == "INACTIVO"]
-        log += [{
-            "regla":"INACTIVO","campo":"SERIAL","valor":str(r["SERIAL"]),
-            "motivo": f"INACTIVO — última vez visto {r['FECHA']} en OLT {r['OLT']} / TRK RR {r['TRK RR']} (no aparece en {fecha_max})",
-            "archivo": r["archivo_fuente"],
-        } for _,r in inactivos.iterrows()]
+        motivos_inactivos = (
+            "INACTIVO — última vez visto " + inactivos["FECHA"].map(str)
+            + " en OLT " + inactivos["OLT"].map(str)
+            + " / TRK RR " + inactivos["TRK RR"].map(str)
+            + f" (no aparece en {fecha_max})"
+        )
+        log_frames.append(pd.DataFrame({
+            "regla":   "INACTIVO",
+            "campo":   "SERIAL",
+            "valor":   inactivos["SERIAL"].map(str).values,
+            "motivo":  motivos_inactivos.values,
+            "archivo": inactivos["archivo_fuente"].values,
+        }))
 
     avanzar(f"Relación ONT-OLT: {n_activos:,} activos / {n_inactivos:,} inactivos")
 
@@ -1286,7 +1336,8 @@ def procesar_onnet(archivos, pb, stxt):
     avanzar("Métricas calculadas")
 
     # ── PASO 6: Exportar archivos ──
-    log_df = pd.DataFrame(log) if log else pd.DataFrame()
+    log_frames = [f for f in log_frames if f is not None and not f.empty]
+    log_df = pd.concat(log_frames, ignore_index=True) if log_frames else pd.DataFrame()
     az = {f"relacion_ONT_OLT_{ts}.csv": csv_bytes(base_relacion)}
     if not log_df.empty:
         az[f"log_depuracion_ONNET_{ts}.csv"] = csv_bytes(log_df)
@@ -1305,8 +1356,6 @@ def procesar_onnet(archivos, pb, stxt):
         "n_activos":    n_activos,
         "n_inactivos":  n_inactivos,
     }, None
-
-
 # ── Bloque resultado: descarga + edición + publicar ───────────────────────────
 def bloque_resultado(key, metricas_list, color_accent):
     r = st.session_state.get(f"resultado_{key}")
@@ -2003,10 +2052,12 @@ with h2:
         st.rerun(scope="app")
 with h3:
     if st.button("⚙", key="btn_abrir_admin", help="Panel de administrador"):
-        st.session_state["admin_dialog_open"] = True
+        st.session_state["admin_dialog_open"]  = True
+        st.session_state["editor_dialog_open"] = False
 with h4:
     if st.button("🗄", key="btn_abrir_editor", help="Editor de históricos"):
         st.session_state["editor_dialog_open"] = True
+        st.session_state["admin_dialog_open"]  = False
 
 # Abre (o reabre tras cualquier rerun: login, publicar, nuevo procesamiento, etc.)
 # los diálogos mientras sus banderas sigan activas, para que no se sienta

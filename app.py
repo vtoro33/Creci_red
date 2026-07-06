@@ -811,6 +811,23 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
     log_frames.append(construir_log_onts(onts_raw, m, "NE Name", "No inicia con ZAC"))
     onts = onts_raw[~m].copy()
 
+
+    # R1b ATP Independiente: NE Name debe contener ATP
+    if vendor_forzado == "ATP":
+        ne_atp = onts["NE Name"].astype(str).str.strip()
+        m_atp = ~ne_atp.str.contains("ATP", case=False, na=False)
+
+        log_frames.append(
+            construir_log_onts(
+                onts,
+                m_atp,
+                "NE Name",
+                "ATP Independiente: NE Name no contiene ATP"
+            )
+        )
+
+        onts = onts[~m_atp].copy()
+
     # R2-R4 numéricos
     for col, lbl in [("Shelf","R2"),("Slot","R3"),("Port","R4")]:
         col_orig = onts[col].copy()
@@ -870,14 +887,32 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
     stxt.markdown('<div class="step-line">⟳ Depurando Troncales...</div>', unsafe_allow_html=True)
 
     ne_tronc_str = tronc_raw["NE Name"].astype(str).str.strip()
-    olts_maestro = tronc_raw[ne_tronc_str.str.startswith("ZAC")][["NE Name"]].drop_duplicates()
-
-    # reg_tronc tenía exactamente el mismo esquema que reg() (mismas columnas de
-    # contexto NE Name/Shelf/Slot/Port), así que reutilizamos construir_log_onts.
 
     m = ~ne_tronc_str.str.startswith("ZAC")
     log_frames.append(construir_log_onts(tronc_raw, m, "NE Name", "No inicia con ZAC"))
     tronc = tronc_raw[~m].copy()
+
+    # R1b ATP Independiente: NE Name debe contener ATP
+    if vendor_forzado == "ATP":
+        ne_atp = tronc["NE Name"].astype(str).str.strip()
+        m_atp = ~ne_atp.str.contains("ATP", case=False, na=False)
+
+        log_frames.append(
+            construir_log_onts(
+                tronc,
+                m_atp,
+                "NE Name",
+                "ATP Independiente: NE Name no contiene ATP"
+            )
+        )
+
+        tronc = tronc[~m_atp].copy()
+
+    olts_maestro = tronc[["NE Name"]].drop_duplicates()
+
+    # reg_tronc tenía exactamente el mismo esquema que reg() (mismas columnas de
+    # contexto NE Name/Shelf/Slot/Port), así que reutilizamos construir_log_onts.
+
 
     for col in ["Shelf","Slot","Port"]:
         col_orig = tronc[col].copy()

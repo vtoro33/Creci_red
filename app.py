@@ -2019,7 +2019,7 @@ def mostrar_notas_publicas(vendor_tag):
     sub = df_notas[df_notas["vendor"] == vendor_tag].sort_values("fecha", ascending=False) if not df_notas.empty else df_notas
     if sub.empty:
         return
-    with st.expander(f"📌 Notas ({len(sub)})"):
+    with st.expander(f"☄︎ Notas ({len(sub)})"):
         for _, row in sub.iterrows():
             texto_html = html.escape(str(row["texto"])).replace("\n", "<br>")
             st.markdown(

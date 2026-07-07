@@ -98,6 +98,7 @@ DETALLE_CONFIG = {
         "col_ont":     "ONU Name",
         "ont_agg":     "nunique",
         "tiene_shelf": True,
+        "col_ip_origen": "NE IP Address",
     },
     "ATP": {
         "col_olt":     "NE Name",
@@ -108,6 +109,7 @@ DETALLE_CONFIG = {
         "col_ont":     "ONU Name",
         "ont_agg":     "nunique",
         "tiene_shelf": True,
+        "col_ip_origen": "NE IP Address",
     },
     "HAW": {
         "col_olt":     "Device name",
@@ -118,6 +120,7 @@ DETALLE_CONFIG = {
         "col_ont":     "ONU Alias",
         "ont_agg":     "count",
         "tiene_shelf": True,
+        "col_ip_origen": "NE IP",
     },
     "ONNET": {
         "col_olt":     "OLT",
@@ -125,6 +128,7 @@ DETALLE_CONFIG = {
         "col_ont":     "SERIAL",
         "ont_agg":     "nunique",
         "tiene_shelf": False,
+        # Sin "col_ip_origen" a propósito: ONNET no maneja IP.
     },
 }
 
@@ -361,6 +365,11 @@ def detalle_por_olt(vendor):
     col_olt     = cfg["col_olt"]
     col_troncal = cfg["col_troncal"]
     tiene_shelf = cfg.get("tiene_shelf", False)
+    # Solo los vendors configurados con 'col_ip_origen' (ZTE/ATP/HAW) manejan IP.
+    # Además, archivos detalle_X.csv generados ANTES de este cambio no tendrán la
+    # columna "IP" — por eso se valida también que exista en el df ya leído,
+    # para no romper con datos históricos.
+    tiene_ip = bool(cfg.get("col_ip_origen")) and "IP" in df.columns
 
     # ── Sección informativa: OLTs sin troncales asociadas ──
     olts_sin = df[df[col_troncal] == PLACEHOLDER][col_olt].unique().tolist()
@@ -372,13 +381,37 @@ def detalle_por_olt(vendor):
             f'sin troncales asociadas: {lista}</div>',
             unsafe_allow_html=True)
 
-    # ── Selectbox para elegir OLT ──
-    olts    = sorted(df[col_olt].dropna().unique().tolist(), key=str)
-    olt_sel = st.selectbox(
-        "Selecciona una OLT",
-        options=olts,
-        key=f"sel_olt_{vendor}",
-    )
+    # ── Selectbox para elegir OLT (buscable por nombre o, si hay, por IP) ──
+    # Importante: Streamlit filtra la búsqueda sobre el VALOR de cada opción, no
+    # sobre lo que muestra format_func. Por eso la IP se incrusta directamente
+    # en la opción (como texto), y luego se recupera el nombre real de la OLT
+    # con un mapa etiqueta -> OLT.
+    olts = sorted(df[col_olt].dropna().unique().tolist(), key=str)
+
+    if tiene_ip:
+        ip_por_olt_map = df.drop_duplicates(subset=[col_olt]).set_index(col_olt)["IP"]
+
+        def _etiqueta_olt(o):
+            ip_val = ip_por_olt_map.get(o)
+            if pd.isna(ip_val) or not str(ip_val).strip():
+                return str(o)
+            return f"{o} — IP: {ip_val}"
+
+        etiquetas = [_etiqueta_olt(o) for o in olts]
+        mapa_etiqueta_a_olt = dict(zip(etiquetas, olts))
+
+        etiqueta_sel = st.selectbox(
+            "Selecciona una OLT (puedes escribir el nombre o la IP)",
+            options=etiquetas,
+            key=f"sel_olt_{vendor}",
+        )
+        olt_sel = mapa_etiqueta_a_olt.get(etiqueta_sel)
+    else:
+        olt_sel = st.selectbox(
+            "Selecciona una OLT",
+            options=olts,
+            key=f"sel_olt_{vendor}",
+        )
     if not olt_sel:
         return
 
@@ -388,6 +421,15 @@ def detalle_por_olt(vendor):
     df_olt_real     = df_olt[df_olt[col_troncal] != PLACEHOLDER]
     total_troncales = len(df_olt_real)
     total_onts      = int(df_olt_real["ONTs"].sum())
+
+    if tiene_ip:
+        vals_ip   = df_olt["IP"].dropna().unique().tolist()
+        ip_actual = vals_ip[0] if vals_ip else None
+        ip_texto  = ip_actual if ip_actual else "No disponible"
+        st.markdown(
+            f'<div class="nota"><div class="nota-texto">🌐 IP de la OLT: '
+            f'<b>{html.escape(str(ip_texto))}</b></div></div>',
+            unsafe_allow_html=True)
 
     mc1, mc2 = st.columns(2)
     with mc1:
@@ -538,7 +580,15 @@ def detectar_grupos(archivos):
     gb = [f for f, p in zip(archivos, pstr) if p == uniq[1]]
     return ga, gb, None
 
-def leer_excel_seguro(archivo, columnas, sheet=None, conservar_na_texto=False):
+def leer_excel_seguro(archivo, columnas, sheet=None, conservar_na_texto=False, columnas_opcionales=None):
+    """Lee un Excel de forma segura.
+
+    'columnas' son obligatorias: si falta alguna, se rechaza el archivo (comportamiento
+    sin cambios respecto a antes).
+    'columnas_opcionales' (nuevo) son columnas que, si existen en el archivo, se incluyen
+    tal cual; si NO existen, se agregan como NaN sin generar ningún error — para datos
+    informativos (como la IP de la OLT) que no siempre vienen en todos los archivos.
+    """
     try:
         kwargs = {}
         if conservar_na_texto:
@@ -561,7 +611,15 @@ def leer_excel_seguro(archivo, columnas, sheet=None, conservar_na_texto=False):
         faltantes = [c for c in columnas if c not in df.columns]
         if faltantes:
             return None, f"'{archivo.name}' no tiene columnas: {', '.join(faltantes)}"
-        return df[columnas].copy(), None
+
+        columnas_finales = list(columnas)
+        for col_opc in (columnas_opcionales or []):
+            if col_opc not in df.columns:
+                df[col_opc] = pd.NA
+            if col_opc not in columnas_finales:
+                columnas_finales.append(col_opc)
+
+        return df[columnas_finales].copy(), None
     except Exception as e:
         msg = str(e)
         if "password" in msg.lower() or "encrypt" in msg.lower():
@@ -735,6 +793,13 @@ def generar_detalle(key, vendors):
                 filas_ph.append(fila)
             det = pd.concat([det, pd.DataFrame(filas_ph)], ignore_index=True)
 
+        # IP por OLT (informativa) → se agrega solo para vendors configurados con
+        # 'col_ip_origen' (ZTE/ATP/HAW). ONNET no tiene esa clave, así que este
+        # bloque se salta por completo para ONNET, sin ningún efecto sobre él.
+        if cfg.get("col_ip_origen") and "IP" in base_vendor.columns:
+            ip_por_olt_det = base_vendor[[col_olt, "IP"]].drop_duplicates(subset=[col_olt])
+            det = det.merge(ip_por_olt_det, on=col_olt, how="left")
+
         rotar_y_guardar_detalle(vendor, det)
 
 def verificar_password(pwd):
@@ -748,6 +813,59 @@ def mostrar_ok(msg):
 
 def mostrar_warn(msg):
     st.markdown(f'<div class="warn-box"><div class="warn-text">⚠ {msg}</div></div>', unsafe_allow_html=True)
+
+def resolver_ip_por_olt(df, col_olt, col_ip):
+    """Calcula la IP de cada OLT a partir de las filas de Troncales, de forma
+    totalmente independiente del resto de la depuración (no elimina ni modifica
+    ninguna fila de la base de troncales).
+
+    Reglas:
+    - Si la OLT tiene 0 IPs registradas (o la columna no existe en el archivo) -> IP vacía.
+    - Si la OLT tiene exactamente 1 IP distinta -> se usa esa IP.
+    - Si la OLT tiene 2+ IPs distintas -> se marca "Revisar (N IPs distintas)" y se
+      genera una entrada de log para que quede visible y no se pierda la inconsistencia.
+
+    Retorna (df_ip, log_extra):
+        df_ip: DataFrame con columnas [col_olt, "IP"], una fila por OLT.
+        log_extra: lista de dicts (mismo estilo que los demás logs) para las OLTs
+                   con IPs conflictivas. Vacía si no hay conflictos.
+    """
+    if col_ip not in df.columns:
+        return pd.DataFrame({col_olt: df[col_olt].dropna().unique(), "IP": pd.NA}), []
+
+    ip_str = df[col_ip].astype(str).str.strip()
+    ip_valida = df[col_ip].notna() & (ip_str != "") & (ip_str.str.lower() != "nan")
+
+    sub = df.loc[ip_valida, [col_olt]].copy()
+    sub["_ip"] = ip_str.loc[ip_valida]
+
+    filas_ip = []
+    log_extra = []
+    for olt, grupo in sub.groupby(col_olt):
+        ips_unicas = sorted(grupo["_ip"].unique())
+        if len(ips_unicas) == 0:
+            ip_final = pd.NA
+        elif len(ips_unicas) == 1:
+            ip_final = ips_unicas[0]
+        else:
+            ip_final = f"Revisar ({len(ips_unicas)} IPs distintas)"
+            log_extra.append({
+                "olt": olt,
+                "columna": col_ip,
+                "motivo": f"OLT con {len(ips_unicas)} IPs distintas en archivo de Troncales: {', '.join(ips_unicas)}",
+            })
+        filas_ip.append({col_olt: olt, "IP": ip_final})
+
+    # OLTs que no tuvieron ninguna IP válida también deben quedar con IP vacía,
+    # no solo ausentes del resultado.
+    todas_olts = df[col_olt].dropna().unique()
+    olts_con_ip = {f[col_olt] for f in filas_ip}
+    for olt in todas_olts:
+        if olt not in olts_con_ip:
+            filas_ip.append({col_olt: olt, "IP": pd.NA})
+
+    return pd.DataFrame(filas_ip), log_extra
+
 
 # ── Procesadores ──────────────────────────────────────────────────────────────
 def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
@@ -875,7 +993,8 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
     stxt.markdown('<div class="step-line">⟳ Leyendo archivos de Troncales...</div>', unsafe_allow_html=True)
     lista = []
     for f in archivos_tronc:
-        df, err = leer_excel_seguro(f, COLS_TRONC, conservar_na_texto=True)
+        df, err = leer_excel_seguro(f, COLS_TRONC, conservar_na_texto=True,
+                                     columnas_opcionales=["NE IP Address"])
         if err: return None, err
         df["archivo_fuente"] = f.name
         lista.append(df)
@@ -909,6 +1028,24 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
         tronc = tronc[~m_atp].copy()
 
     olts_maestro = tronc[["NE Name"]].drop_duplicates()
+
+    # ── IP por OLT (informativo, independiente de la depuración de troncales) ──
+    # Se calcula aquí, sobre el mismo conjunto de OLTs válidas que olts_maestro
+    # (ya pasó el filtro ZAC y, si aplica, el filtro ATP Independiente), pero
+    # ANTES de las reglas R2-R4/TRK, porque la IP es un dato de la OLT y no
+    # depende de si una troncal puntual es válida o no.
+    ip_por_olt, log_extra_ip = resolver_ip_por_olt(tronc, "NE Name", "NE IP Address")
+    if log_extra_ip:
+        log_frames.append(pd.DataFrame([{
+            "archivo_fuente": "", "NE_Name": e["olt"],
+            "Shelf": "", "Slot": "", "Port": "",
+            "columna": e["columna"], "valor_original": "",
+            "motivo": e["motivo"],
+        } for e in log_extra_ip]))
+    # Se retira la columna de IP de 'tronc' de inmediato: de aquí en adelante el
+    # pipeline (dedup, puertos ambiguos, cruce) queda idéntico a como estaba antes.
+    if "NE IP Address" in tronc.columns:
+        tronc = tronc.drop(columns=["NE IP Address"])
 
     # reg_tronc tenía exactamente el mismo esquema que reg() (mismas columnas de
     # contexto NE Name/Shelf/Slot/Port), así que reutilizamos construir_log_onts.
@@ -978,6 +1115,7 @@ def procesar_zte_atp(archivos, grupo_tronc, pb, stxt, vendor_forzado=None):
         olts_maestro
         .merge(tronc.drop(columns=["archivo_fuente"]), on="NE Name", how="left")
         .merge(onts_dep.drop(columns=["archivo_fuente"]), on=["NE Name","Shelf","Slot","Port"], how="left")
+        .merge(ip_por_olt, on="NE Name", how="left")
     )
     base["fecha_carga"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     if vendor_forzado:
@@ -1128,7 +1266,8 @@ def procesar_huawei(archivos, grupo_tronc, pb, stxt):
     stxt.markdown('<div class="step-line">⟳ Leyendo Troncales...</div>', unsafe_allow_html=True)
     lista = []
     for f in archivos_tronc:
-        df, err = leer_excel_seguro(f, COLS_TRONC, conservar_na_texto=True)
+        df, err = leer_excel_seguro(f, COLS_TRONC, conservar_na_texto=True,
+                                     columnas_opcionales=["NE IP"])
         if err: return None, err
         df["archivo_fuente"] = f.name
         lista.append(df)
@@ -1142,12 +1281,29 @@ def procesar_huawei(archivos, grupo_tronc, pb, stxt):
     dn_tronc_str = tronc_raw["Device name"].astype(str).str.strip()
     olts_maestro = tronc_raw[dn_tronc_str.str.startswith("HAC")][["Device name"]].drop_duplicates()
 
+    # ── IP por OLT (informativo, independiente de la depuración) ──
+    # Igual que en ZTE/ATP: se calcula sobre las OLTs válidas (prefijo HAC), antes
+    # de las reglas numéricas, y se retira de 'tronc' de inmediato para no alterar
+    # el pipeline existente (dedup, cruce, etc.)
+    ip_por_olt, log_extra_ip = resolver_ip_por_olt(
+        tronc_raw[dn_tronc_str.str.startswith("HAC")], "Device name", "NE IP"
+    )
+    if log_extra_ip:
+        log_frames.append(pd.DataFrame([{
+            "archivo_fuente": "", "Device_name": e["olt"],
+            "Frame_ID": "", "Slot_ID": "", "Port_ID": "",
+            "columna": e["columna"], "valor_original": "",
+            "motivo": e["motivo"],
+        } for e in log_extra_ip]))
+
     # reg_tronc_haw tenía exactamente el mismo esquema que reg_haw(), así que
     # reutilizamos construir_log_haw.
 
     m = ~dn_tronc_str.str.startswith("HAC")
     log_frames.append(construir_log_haw(tronc_raw, m, "Device name", "No inicia con HAC"))
     tronc = tronc_raw[~m].copy()
+    if "NE IP" in tronc.columns:
+        tronc = tronc.drop(columns=["NE IP"])
 
     for col in ["Frame ID","Slot ID","Port ID"]:
         col_orig = tronc[col].copy()
@@ -1191,6 +1347,7 @@ def procesar_huawei(archivos, grupo_tronc, pb, stxt):
         olts_maestro
         .merge(tronc.drop(columns=["archivo_fuente","RunStatus"]), on="Device name", how="left")
         .merge(cli_dep.drop(columns=["archivo_fuente","Running Status"]), on=["Device name","Frame ID","Slot ID","Port ID"], how="left")
+        .merge(ip_por_olt, on="Device name", how="left")
     )
     base["vendor"]      = "HAW"
     base["fecha_carga"] = datetime.now().strftime("%Y-%m-%d %H:%M")

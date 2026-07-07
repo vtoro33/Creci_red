@@ -2670,7 +2670,7 @@ with h0:
     st.image("Claro-logo_1.png", width=70)
 
 with h1:
-    st.markdown("## 🖧 Red FTTH — Crecimiento Residencial")
+    st.markdown("## 🖧 Red FTTH — Crecimiento")
     if not hist.empty:
         ultima     = hist["fecha_carga"].max()
         ultima_str = ultima.strftime("%d %b %Y") if (ultima.hour == 0 and ultima.minute == 0) else ultima.strftime("%d %b %Y — %H:%M")

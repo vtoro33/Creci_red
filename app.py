@@ -170,6 +170,21 @@ div[data-baseweb="popover"]{margin-top:4px !important}
 ul[role="listbox"]{max-height:220px !important}
 .detalle-titulo{font-size:14px;color:rgba(255,255,255,0.55);text-transform:uppercase;letter-spacing:1px;margin:24px 0 12px 0;padding-bottom:8px;border-bottom:0.5px solid rgba(255,255,255,0.1)}
 .olts-sin-troncal{background:linear-gradient(135deg,#2d1f0a,#3d2a0a);border-left:3px solid #f6ad55;border-radius:0 10px 10px 0;padding:12px 18px;margin:8px 0 16px 0;font-size:12px;color:rgba(255,255,255,0.6);line-height:1.7}
+/* ── MODO MANUAL (tour interactivo) ── */
+.tour-anchor{height:0;margin:0;padding:0;overflow:hidden;line-height:0}
+/* Los botones reales de navegación quedan ocultos: la barra visible la dibuja
+   JavaScript directamente sobre <body>, no depende de la estructura interna
+   de Streamlit. Si por algún motivo esta regla no aplica, los botones reales
+   simplemente aparecen al final de la página — nunca bloquean la salida. */
+.tour-toolbar-marker{display:none}
+div[data-testid="element-container"]:has(.tour-toolbar-marker) + div[data-testid="stHorizontalBlock"]{
+    opacity:0 !important; height:0 !important; overflow:hidden !important;
+    pointer-events:none !important; margin:0 !important; padding:0 !important;
+}
+.tour-toggle-marker{display:none}
+div[data-testid="element-container"]:has(.tour-toggle-marker) + div[data-testid="stHorizontalBlock"] button{
+    background:rgba(99,179,237,0.14) !important;border:1px solid rgba(99,179,237,0.5) !important;color:#63b3ed !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -196,6 +211,9 @@ for k, v in {
     "editor_dialog_open":    False,
     "editor_login_attempts": 0,
     "editor_lockout_until":  None,
+    # ── MODO MANUAL (tour interactivo) ──
+    "modo_manual": False,
+    "tour_paso":   0,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -307,6 +325,8 @@ def vista(vendor, hist):
     ultimo   = df.iloc[-1]
     anterior = df.iloc[-2] if len(df) > 1 else None
 
+    if vendor == "ZTE":
+        tour_anchor("tour_zte_tarjetas")
     c1, c2, c3 = st.columns(3)
     with c1:
         delta = int(ultimo["total_olts"] - anterior["total_olts"]) if anterior is not None else None
@@ -319,6 +339,8 @@ def vista(vendor, hist):
         tarjeta("⏣ ONTs activas", ultimo["total_onts"], delta, c_onts)
 
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+    if vendor == "ZTE":
+        tour_anchor("tour_zte_graficas")
     if len(df) > 1:
         g1, g2, g3 = st.columns(3)
         with g1: grafica(df, "total_olts",      c_olts,  "⎕ OLTs")
@@ -343,6 +365,8 @@ def detalle_por_olt(vendor):
         f'{VENDOR_NOMBRE.get(vendor, vendor)}</div>',
         unsafe_allow_html=True)
 
+    if vendor == "ZTE":
+        tour_anchor("tour_zte_descarga_anterior")
     mostrar_descarga_anterior(vendor, "vista")
 
     if not os.path.exists(ruta):
@@ -372,6 +396,8 @@ def detalle_por_olt(vendor):
     tiene_ip = bool(cfg.get("col_ip_origen")) and "IP" in df.columns
 
     # ── Sección informativa: OLTs sin troncales asociadas ──
+    if vendor == "ZTE":
+        tour_anchor("tour_zte_aviso_sin_troncal")
     olts_sin = df[df[col_troncal] == PLACEHOLDER][col_olt].unique().tolist()
     if olts_sin:
         lista = ", ".join(sorted(olts_sin, key=str))
@@ -388,6 +414,8 @@ def detalle_por_olt(vendor):
     # con un mapa etiqueta -> OLT.
     olts = sorted(df[col_olt].dropna().unique().tolist(), key=str)
 
+    if vendor == "ZTE":
+        tour_anchor("tour_zte_selector_olt")
     if tiene_ip:
         ip_por_olt_map = df.drop_duplicates(subset=[col_olt]).set_index(col_olt)["IP"]
 
@@ -422,6 +450,8 @@ def detalle_por_olt(vendor):
     total_troncales = len(df_olt_real)
     total_onts      = int(df_olt_real["ONTs"].sum())
 
+    if vendor == "ZTE":
+        tour_anchor("tour_zte_tarjetas_olt")
     if tiene_ip:
         vals_ip   = df_olt["IP"].dropna().unique().tolist()
         ip_actual = vals_ip[0] if vals_ip else None
@@ -479,6 +509,8 @@ def detalle_por_olt(vendor):
             df_tabla[col_num] = pd.to_numeric(df_tabla[col_num], errors="coerce").astype("Int64")
 
     # ── Filtros individuales por columna ──
+    if vendor == "ZTE":
+        tour_anchor("tour_zte_filtros")
     if tiene_shelf:
         fc1, fc2, fc3, fc4 = st.columns(4)
         with fc1:
@@ -521,6 +553,8 @@ def detalle_por_olt(vendor):
             df_tabla = df_tabla[df_tabla["TRK RR"] == sel_trk]
 
     # ── Mostrar tabla ──
+    if vendor == "ZTE":
+        tour_anchor("tour_zte_tabla")
     if df_tabla.empty:
         st.markdown(
             '<div class="pending"><p style="font-size:13px">'
@@ -813,6 +847,411 @@ def mostrar_ok(msg):
 
 def mostrar_warn(msg):
     st.markdown(f'<div class="warn-box"><div class="warn-text">⚠ {msg}</div></div>', unsafe_allow_html=True)
+
+
+# ── MODO MANUAL (tour interactivo) ───────────────────────────────────────────
+# Diseño: cada "paso" apunta a un ancla invisible (tour_anchor) colocada justo
+# ANTES del elemento real que se quiere explicar. En el navegador, un script
+# inyectado con components.html localiza esa ancla, resalta el elemento que
+# le sigue (spotlight + borde) y muestra un tooltip con el patrón fijo:
+# Qué es / Para qué sirve / Cómo se usa. Un backdrop de pantalla completa
+# bloquea cualquier clic real mientras el tour está activo; solo la barra de
+# navegación (Anterior / Siguiente / Salir), con z-index más alto, queda
+# interactiva. No se toca ninguna función de negocio existente.
+
+TOUR_STEPS = [
+    # ── Capítulo 0: Header (tab=None, no depende de ninguna pestaña) ──
+    {
+        "anchor": "tour_btn_actualizar",
+        "tab": None,
+        "titulo": "⟳ Actualizar datos",
+        "que_es": "Botón que limpia la caché interna de la aplicación.",
+        "para_que": "Forzar una relectura de los archivos históricos y de detalle, por si se actualizaron por fuera de la app.",
+        "como_se_usa": "Haz clic y la página se recarga con los datos más recientes en disco.",
+    },
+    {
+        "anchor": "tour_btn_admin",
+        "tab": None,
+        "titulo": "⚙ Panel de Administrador",
+        "que_es": "Acceso protegido con contraseña donde se procesan los archivos Excel de cada proveedor (ZTE, ATP, Huawei, ONNET), se gestionan notas y se cambia la contraseña.",
+        "para_que": "Cargar nueva información a la red y mantener el histórico actualizado.",
+        "como_se_usa": "Haz clic para abrir el panel; se pedirá la contraseña de administrador.",
+        "advertencia": "Más adelante en este recorrido entraremos a este panel en una vista de solo lectura, para que veas cómo funciona sin poder modificar nada.",
+    },
+    {
+        "anchor": "tour_btn_editor",
+        "tab": None,
+        "titulo": "🗄 Editor de Históricos",
+        "que_es": "Acceso protegido (misma contraseña de administrador) para editar directamente los registros históricos de OLTs, Troncales y ONTs por vendor.",
+        "para_que": "Corregir un dato mal cargado o eliminar un registro duplicado sin tener que reprocesar todo.",
+        "como_se_usa": "Haz clic para abrir el editor; ahí eliges el vendor y editas la tabla directamente.",
+    },
+    {
+        "anchor": "tour_nota_general",
+        "tab": None,
+        "titulo": "≡ Nota de corte de fecha",
+        "que_es": "Aviso que indica hasta qué fecha y hora corresponden los valores mostrados en toda la aplicación.",
+        "para_que": "Evitar confusiones sobre si los datos están 'en vivo' o corresponden a un corte puntual.",
+        "como_se_usa": "Solo lectura — revisa esta fecha antes de interpretar cualquier cifra.",
+    },
+    # ── Capítulo 1: Pestaña General ──
+    {
+        "anchor": "tour_notas_general",
+        "tab": "⎔ General",
+        "titulo": "☄︎ Notas (pestaña General)",
+        "que_es": "Comentarios agregados por un administrador, específicos de esta pestaña.",
+        "para_que": "Documentar eventos relevantes (ej. una incidencia, un cambio de metodología) para quien consulte el dashboard.",
+        "como_se_usa": "Haz clic en el expander para desplegarlas. Solo lectura desde aquí.",
+    },
+    {
+        "anchor": "tour_consolidado_general",
+        "tab": "⎔ General",
+        "titulo": "⎔ Consolidado General",
+        "que_es": "La suma de OLTs, Troncales y ONTs de todos los vendors, tomando la última carga de cada uno.",
+        "para_que": "Tener de un vistazo el tamaño total de la red FTTH sin entrar a cada pestaña de vendor.",
+        "como_se_usa": "Solo lectura — se recalcula automáticamente con cada nueva carga.",
+    },
+    {
+        "anchor": "tour_por_vendor",
+        "tab": "⎔ General",
+        "titulo": "Tarjetas por vendor",
+        "que_es": "Un resumen individual de OLTs, Troncales y ONTs para cada proveedor (ZTE, Huawei, ATP, ONNET).",
+        "para_que": "Comparar rápidamente el aporte de cada vendor a la red total.",
+        "como_se_usa": "Solo lectura. Si un vendor aún no tiene datos cargados, se muestra como 'Pendiente'.",
+        "advertencia": "En el siguiente capítulo entraremos a fondo en la pestaña de ZTE.",
+    },
+    # ── Capítulo 2: Pestaña ZTE (a fondo) ──
+    {
+        "anchor": "tour_zte_notas",
+        "tab": "⊞ ZTE",
+        "titulo": "☄︎ Notas (pestaña ZTE)",
+        "que_es": "Igual que en General, pero específicas de este vendor.",
+        "para_que": "Documentar particularidades de la red ZTE (ej. una OLT en mantenimiento).",
+        "como_se_usa": "Haz clic en el expander para desplegarlas. Solo lectura desde aquí.",
+    },
+    {
+        "anchor": "tour_zte_tarjetas",
+        "tab": "⊞ ZTE",
+        "titulo": "Tarjetas OLTs / Troncales / ONTs",
+        "que_es": "Los tres totales más recientes de la red ZTE, con el cambio (delta) respecto a la carga anterior.",
+        "para_que": "Ver de un vistazo si la red creció, se mantuvo o disminuyó desde la última lectura.",
+        "como_se_usa": "Solo lectura. La flecha ↑ verde aparece solo si hubo crecimiento respecto a la lectura anterior.",
+    },
+    {
+        "anchor": "tour_zte_graficas",
+        "tab": "⊞ ZTE",
+        "titulo": "Gráficas de evolución",
+        "que_es": "Tres gráficas de línea que muestran cómo han cambiado OLTs, Troncales y ONTs a lo largo de las cargas históricas.",
+        "para_que": "Detectar tendencias de crecimiento o caídas anómalas en el tiempo.",
+        "como_se_usa": "Arrastra el control deslizante inferior (aparece si hay más de 8 lecturas) para ver periodos más antiguos. Pasa el cursor sobre un punto para ver el valor exacto.",
+    },
+    {
+        "anchor": "tour_zte_descarga_anterior",
+        "tab": "⊞ ZTE",
+        "titulo": "⬇ Descargar detalle anterior",
+        "que_es": "Botón que aparece solo si existe una versión previa del detalle por OLT (antes de la última publicación).",
+        "para_que": "Comparar manualmente el estado anterior contra el actual, por ejemplo para auditar un cambio grande.",
+        "como_se_usa": "Haz clic para descargar el CSV con el detalle previo a la última carga.",
+    },
+    {
+        "anchor": "tour_zte_aviso_sin_troncal",
+        "tab": "⊞ ZTE",
+        "titulo": "⊜ Aviso de OLTs sin troncales",
+        "que_es": "Lista de OLTs que existen en la base de datos pero no tienen ninguna troncal asociada.",
+        "para_que": "Detectar equipos posiblemente mal configurados o recién instalados sin tráfico aún.",
+        "como_se_usa": "Solo lectura — solo aparece si existen OLTs en esa condición.",
+    },
+    {
+        "anchor": "tour_zte_selector_olt",
+        "tab": "⊞ ZTE",
+        "titulo": "Selector de OLT",
+        "que_es": "Un buscador para elegir una OLT específica y ver su detalle, buscable por nombre o por IP.",
+        "para_que": "Enfocarte en una sola OLT sin tener que revisar la tabla completa de la red.",
+        "como_se_usa": "Haz doble clic para seleccionar todo el texto y pegar un nombre o IP directamente, o escribe para filtrar la lista.",
+    },
+    {
+        "anchor": "tour_zte_tarjetas_olt",
+        "tab": "⊞ ZTE",
+        "titulo": "IP y tarjetas de la OLT seleccionada",
+        "que_es": "La dirección IP de la OLT (si está disponible) y sus totales de Troncales y ONTs.",
+        "para_que": "Tener los datos de contacto/identificación de la OLT junto con su tamaño actual.",
+        "como_se_usa": "Solo lectura — cambia automáticamente al elegir otra OLT en el selector.",
+    },
+    {
+        "anchor": "tour_zte_filtros",
+        "tab": "⊞ ZTE",
+        "titulo": "Filtros de la tabla (Shelf / Slot / Port / Troncal)",
+        "que_es": "Cuatro filtros independientes para acotar la tabla de troncales de la OLT seleccionada.",
+        "para_que": "Ubicar una troncal específica sin desplazarte por toda la tabla.",
+        "como_se_usa": "Cada filtro funciona por separado — puedes combinar varios a la vez. 'Todos' quita el filtro.",
+    },
+    {
+        "anchor": "tour_zte_tabla",
+        "tab": "⊞ ZTE",
+        "titulo": "Tabla de troncales y ONTs",
+        "que_es": "El detalle final: cada troncal de la OLT seleccionada con su cantidad de ONTs asociadas.",
+        "para_que": "Consultar el detalle exacto por puerto físico de la OLT.",
+        "como_se_usa": "Solo lectura — se actualiza según los filtros que apliques arriba.",
+        "advertencia": "Huawei, ATP y ONNET funcionan exactamente igual a lo que acabas de ver — la única diferencia es que ONNET no maneja Shelf/Slot ni IP, porque su estructura de red es distinta. Con esto, terminamos el recorrido por las pestañas de datos y seguimos con el Panel de Administrador.",
+    },
+]
+
+def tour_anchor(anchor_id):
+    """Marca invisible justo antes del elemento real que se quiere explicar."""
+    st.markdown(f'<div class="tour-anchor" id="{anchor_id}"></div>', unsafe_allow_html=True)
+
+def _tour_tooltip_html(paso_idx, total):
+    step = TOUR_STEPS[paso_idx]
+    adv = ""
+    if step.get("advertencia"):
+        adv = (
+            f'<div style="margin-top:10px;padding:8px 10px;background:rgba(246,173,85,0.12);'
+            f'border-left:2px solid #f6ad55;border-radius:0 6px 6px 0;color:#f6ad55;font-size:12px;">'
+            f'⚠ {html.escape(step["advertencia"])}</div>'
+        )
+    return f"""
+    <div style="font-size:10px;letter-spacing:1px;color:rgba(255,255,255,0.4);text-transform:uppercase;margin-bottom:6px;">
+        Paso {paso_idx+1} de {total}
+    </div>
+    <div style="font-size:14px;font-weight:700;color:#63b3ed;margin-bottom:8px;">{html.escape(step['titulo'])}</div>
+    <div style="font-size:12px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:0.5px;margin-top:8px;">Qué es</div>
+    <div style="font-size:13px;color:rgba(255,255,255,0.85);line-height:1.5;">{html.escape(step['que_es'])}</div>
+    <div style="font-size:12px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:0.5px;margin-top:8px;">Para qué sirve</div>
+    <div style="font-size:13px;color:rgba(255,255,255,0.85);line-height:1.5;">{html.escape(step['para_que'])}</div>
+    <div style="font-size:12px;color:rgba(255,255,255,0.5);text-transform:uppercase;letter-spacing:0.5px;margin-top:8px;">Cómo se usa</div>
+    <div style="font-size:13px;color:rgba(255,255,255,0.85);line-height:1.5;">{html.escape(step['como_se_usa'])}</div>
+    {adv}
+    """.replace("\n", "")
+
+def render_tour_toggle_button():
+    """Botón para activar el modo manual (fila propia, no toca el header existente)."""
+    st.markdown('<div class="tour-toggle-marker"></div>', unsafe_allow_html=True)
+    tcol, _ = st.columns([1, 6])
+    with tcol:
+        if st.button("🛈 Modo manual", key="btn_tour_toggle"):
+            st.session_state["modo_manual"] = not st.session_state["modo_manual"]
+            st.session_state["tour_paso"] = 0
+            st.rerun(scope="app")
+
+def render_tour_toolbar():
+    """Botones REALES de Streamlit (ocultos vía CSS) que cambian el estado del
+    tour. La barra que el usuario VE la dibuja render_tour_overlay_script()
+    directamente en el navegador y, al hacer clic, dispara estos botones
+    reales — así el clic nunca depende de que Streamlit reposicione nada."""
+    if not st.session_state.get("modo_manual"):
+        return
+    total = len(TOUR_STEPS)
+    paso  = min(st.session_state.get("tour_paso", 0), total - 1)
+    st.session_state["tour_paso"] = paso
+
+    st.markdown('<div class="tour-toolbar-marker"></div>', unsafe_allow_html=True)
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        if st.button("◀ Anterior", key="btn_tour_prev"):
+            st.session_state["tour_paso"] = max(0, paso - 1)
+            st.rerun(scope="app")
+    with b2:
+        if st.button("Siguiente ▶", key="btn_tour_next"):
+            st.session_state["tour_paso"] = min(total - 1, paso + 1)
+            st.rerun(scope="app")
+    with b3:
+        if st.button("✕ Salir", key="btn_tour_exit"):
+            st.session_state["modo_manual"] = False
+            st.session_state["tour_paso"] = 0
+            st.rerun(scope="app")
+
+def render_tour_overlay_script():
+    """Inyecta (o limpia) el overlay visual del tour: fondo oscuro, spotlight,
+    tooltip y una barra de navegación creada enteramente con JS/CSS propios
+    (no depende de reposicionar widgets de Streamlit). La barra, al hacer
+    clic, dispara los botones REALES ocultos de render_tour_toolbar().
+    Salidas de emergencia: botón "Salir" en la barra, clic en el fondo oscuro,
+    y tecla Escape — cualquiera de las tres cierra el tour."""
+    IDS = ["tour-overlay-backdrop", "tour-spotlight-box", "tour-tooltip-box", "tour-nav-bar"]
+    if st.session_state.get("modo_manual"):
+        total = len(TOUR_STEPS)
+        paso  = min(st.session_state.get("tour_paso", 0), total - 1)
+        step  = TOUR_STEPS[paso]
+        tooltip_html = _tour_tooltip_html(paso, total).replace("`", "\\`")
+        anchor_id = step["anchor"]
+        tab_js = "null" if step.get("tab") is None else repr(step["tab"])
+        script = f"""
+        <script>
+        try {{
+            var w = window.parent, d = w.document;
+            {str(IDS)}.forEach(function(id){{
+                var el = d.getElementById(id); if (el) el.remove();
+            }});
+
+            function encontrarBoton(texto) {{
+                return Array.from(d.querySelectorAll('button')).find(function(b) {{
+                    return b.innerText && b.innerText.trim() === texto;
+                }});
+            }}
+            function salir() {{
+                var b = encontrarBoton('✕ Salir');
+                if (b) b.click();
+            }}
+            function activarPestana(texto) {{
+                if (!texto) return false;
+                var tabs = Array.from(d.querySelectorAll('button[role="tab"]'));
+                var tab = tabs.find(function(t) {{ return t.innerText && t.innerText.trim() === texto; }});
+                if (tab && tab.getAttribute('aria-selected') !== 'true') {{
+                    tab.click();
+                    return true;
+                }}
+                return false;
+            }}
+
+            // ── Fondo oscuro (bloquea clics reales; clic aquí también sale) ──
+            var backdrop = d.createElement('div');
+            backdrop.id = 'tour-overlay-backdrop';
+            Object.assign(backdrop.style, {{
+                position:'fixed', top:'0', left:'0', width:'100vw', height:'100vh',
+                background:'rgba(0,0,0,0.55)', zIndex:'999990', pointerEvents:'auto', cursor:'default'
+            }});
+            backdrop.title = 'Clic para salir del modo manual';
+            backdrop.onclick = salir;
+            d.body.appendChild(backdrop);
+
+            // ── Tecla Escape también sale ──
+            if (!w.__tourEscBound) {{
+                w.addEventListener('keydown', function(e) {{
+                    if (e.key === 'Escape') {{ var b = encontrarBoton('✕ Salir'); if (b) b.click(); }}
+                }});
+                w.__tourEscBound = true;
+            }}
+
+            // ── Cambiar de pestaña si el paso lo requiere, luego montar el spotlight ──
+            // (un pequeño retraso deja que Streamlit termine de mostrar la pestaña antes
+            // de medir posiciones con getBoundingClientRect)
+            var seCambioPestana = activarPestana({tab_js});
+
+            function montarSpotlight() {{
+                // Si el ancla no existe (ej. la sección aún no tiene datos cargados),
+                // el tooltip se muestra igual, centrado, en vez de desaparecer.
+                var anchor = d.getElementById('{anchor_id}');
+                var target = null;
+                if (anchor) {{
+                    var container = anchor.closest('[data-testid="stElementContainer"]') || anchor.parentElement;
+                    target = container ? container.nextElementSibling : null;
+                }}
+
+                if (target) {{
+                    var box = d.createElement('div');
+                    box.id = 'tour-spotlight-box';
+                    Object.assign(box.style, {{
+                        position:'fixed', zIndex:'999995', border:'3px solid #63b3ed',
+                        borderRadius:'10px', boxShadow:'0 0 0 6000px rgba(0,0,0,0.55)',
+                        pointerEvents:'none', transition:'all 0.25s ease'
+                    }});
+                    d.body.appendChild(box);
+                }}
+
+                var tip = d.createElement('div');
+                tip.id = 'tour-tooltip-box';
+                Object.assign(tip.style, {{
+                    position:'fixed', zIndex:'999996', maxWidth:'340px',
+                    background:'#1e2a4a', border:'1px solid rgba(99,179,237,0.4)',
+                    borderRadius:'12px', padding:'14px 16px', color:'#fff',
+                    boxShadow:'0 8px 30px rgba(0,0,0,0.5)', pointerEvents:'none'
+                }});
+                tip.innerHTML = `{tooltip_html}`;
+                d.body.appendChild(tip);
+
+                function posicionar() {{
+                    if (target) {{
+                        var r = target.getBoundingClientRect();
+                        var box2 = d.getElementById('tour-spotlight-box');
+                        if (box2) {{
+                            box2.style.top = (r.top-8)+'px'; box2.style.left = (r.left-8)+'px';
+                            box2.style.width = (r.width+16)+'px'; box2.style.height = (r.height+16)+'px';
+                        }}
+                        var tipTop = r.bottom + 16;
+                        if (tipTop + 220 > w.innerHeight) tipTop = Math.max(16, r.top - 236);
+                        tip.style.top = tipTop+'px';
+                        var tipLeft = Math.min(Math.max(16, r.left), w.innerWidth-356);
+                        tip.style.left = tipLeft+'px';
+                    }} else {{
+                        // Sin ancla disponible: centrar el tooltip en pantalla.
+                        tip.style.top = (w.innerHeight/2 - 130)+'px';
+                        tip.style.left = (w.innerWidth/2 - 170)+'px';
+                    }}
+                }}
+                posicionar();
+                w.addEventListener('resize', posicionar);
+                w.addEventListener('scroll', posicionar, true);
+                if (target) target.scrollIntoView({{behavior:'smooth', block:'center'}});
+            }}
+
+            if (seCambioPestana) {{
+                setTimeout(montarSpotlight, 80);
+            }} else {{
+                montarSpotlight();
+            }}
+
+            // ── Barra de navegación visible (100% propia, siempre encima de todo) ──
+            var bar = d.createElement('div');
+            bar.id = 'tour-nav-bar';
+            Object.assign(bar.style, {{
+                position:'fixed', bottom:'24px', left:'50%', transform:'translateX(-50%)',
+                zIndex:'999999', background:'#1a2035', border:'1px solid rgba(99,179,237,0.45)',
+                borderRadius:'14px', padding:'10px 14px', boxShadow:'0 10px 34px rgba(0,0,0,0.55)',
+                display:'flex', gap:'10px', alignItems:'center', pointerEvents:'auto',
+                fontFamily:'inherit'
+            }});
+
+            function crearBoton(texto, activo) {{
+                var btn = d.createElement('button');
+                btn.innerText = texto;
+                Object.assign(btn.style, {{
+                    background: activo ? 'rgba(99,179,237,0.16)' : 'rgba(255,255,255,0.05)',
+                    border: '1px solid ' + (activo ? 'rgba(99,179,237,0.55)' : 'rgba(255,255,255,0.15)'),
+                    color: activo ? '#63b3ed' : 'rgba(255,255,255,0.35)',
+                    borderRadius:'8px', padding:'7px 14px', fontSize:'13px', cursor:'pointer'
+                }});
+                return btn;
+            }}
+
+            var btnPrev = crearBoton('◀ Anterior', {str(paso > 0).lower()});
+            btnPrev.onclick = function() {{ var b = encontrarBoton('◀ Anterior'); if (b) b.click(); }};
+            if ({str(paso == 0).lower()}) btnPrev.disabled = true;
+
+            var contador = d.createElement('div');
+            contador.innerText = '{paso+1} / {total}';
+            Object.assign(contador.style, {{ color:'rgba(255,255,255,0.55)', fontSize:'12px', padding:'0 4px' }});
+
+            var btnNext = crearBoton('Siguiente ▶', {str(paso < total - 1).lower()});
+            btnNext.onclick = function() {{ var b = encontrarBoton('Siguiente ▶'); if (b) b.click(); }};
+            if ({str(paso == total - 1).lower()}) btnNext.disabled = true;
+
+            var btnExit = crearBoton('✕ Salir', true);
+            btnExit.style.color = '#f6ad55';
+            btnExit.style.borderColor = 'rgba(246,173,85,0.5)';
+            btnExit.onclick = salir;
+
+            bar.appendChild(btnPrev);
+            bar.appendChild(contador);
+            bar.appendChild(btnNext);
+            bar.appendChild(btnExit);
+            d.body.appendChild(bar);
+
+        }} catch(e) {{ console.error('tour overlay error', e); }}
+        </script>
+        """
+        components.html(script, height=0)
+    else:
+        script_limpieza = """
+        <script>
+        try {
+            var w = window.parent, d = w.document;
+            """ + str(IDS) + """.forEach(function(id){
+                var el = d.getElementById(id); if (el) el.remove();
+            });
+        } catch(e) {}
+        </script>
+        """
+        components.html(script_limpieza, height=0)
 
 def resolver_ip_por_olt(df, col_olt, col_ip):
     """Calcula la IP de cada OLT a partir de las filas de Troncales, de forma
@@ -2239,17 +2678,23 @@ with h1:
         ultima_str = "Sin datos"
     st.markdown(f"<p style='color:rgba(255,255,255,0.35);font-size:12px;margin-top:-10px'>Última ejecución: {ultima_str}</p>", unsafe_allow_html=True)
 with h2:
+    tour_anchor("tour_btn_actualizar")
     if st.button("⟳ Actualizar datos"):
         st.cache_data.clear()
         st.rerun(scope="app")
 with h3:
+    tour_anchor("tour_btn_admin")
     if st.button("⚙", key="btn_abrir_admin", help="Panel de administrador"):
         st.session_state["admin_dialog_open"]  = True
         st.session_state["editor_dialog_open"] = False
 with h4:
+    tour_anchor("tour_btn_editor")
     if st.button("🗄", key="btn_abrir_editor", help="Editor de históricos"):
         st.session_state["editor_dialog_open"] = True
         st.session_state["admin_dialog_open"]  = False
+
+# ── MODO MANUAL: fila propia debajo del header, no altera el header original ──
+render_tour_toggle_button()
 
 # Abre (o reabre tras cualquier rerun: login, publicar, nuevo procesamiento, etc.)
 # los diálogos mientras sus banderas sigan activas, para que no se sienta
@@ -2262,6 +2707,7 @@ if st.session_state.get("editor_dialog_open", False):
 if not hist.empty:
     ultima_nota = hist["fecha_carga"].max()
     fn = ultima_nota.strftime("%d de %B de %Y a las %H:%M") if not (ultima_nota.hour == 0 and ultima_nota.minute == 0) else ultima_nota.strftime("%d de %B de %Y")
+    tour_anchor("tour_nota_general")
     st.markdown(f"""<div class="nota"><div class="nota-texto">
         ≡ Los valores reportados corresponden únicamente a equipos activos y operativos en la red residencial FTTH
         a <span class="nota-fecha">{fn}</span>.
@@ -2275,12 +2721,14 @@ t0, t1, t2, t3, t4 = st.tabs(["⎔ General","⊞ ZTE","⊞ Huawei","⊞ ATP","�
 
 with t0:
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+    tour_anchor("tour_notas_general")
     mostrar_notas_publicas("GENERAL")
     if not hist.empty:
         ultimos         = hist.sort_values("fecha_carga").groupby("vendor").last().reset_index()
         total_olts      = int(ultimos["total_olts"].sum())
         total_troncales = int(ultimos["total_troncales"].sum())
         total_onts      = int(ultimos["total_onts"].sum())
+        tour_anchor("tour_consolidado_general")
         st.markdown("#### ⎔ Consolidado General")
         tc1, tc2, tc3 = st.columns(3)
         with tc1:
@@ -2290,6 +2738,7 @@ with t0:
         with tc3:
             st.markdown(f'<div class="mcard" style="border-color:#63b3ed44"><div class="mlabel" style="color:#63b3ed">▲ Total ONTs</div><div class="mval">{total_onts:,}</div></div>', unsafe_allow_html=True)
         st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+        tour_anchor("tour_por_vendor")
         st.markdown("#### Por vendor")
     cols = st.columns(4)
     for i, vendor in enumerate(["ZTE","HAW","ATP","ONNET"]):
@@ -2312,6 +2761,7 @@ with t0:
 
 with t1:
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+    tour_anchor("tour_zte_notas")
     mostrar_notas_publicas("ZTE")
     vista("ZTE", hist)
 
@@ -2329,3 +2779,8 @@ with t4:
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
     mostrar_notas_publicas("ONNET")
     vista("ONNET", hist)
+
+# ── MODO MANUAL: se renderiza al final para que el overlay encuentre ──
+# ── todos los elementos ya dibujados en el DOM. ──
+render_tour_toolbar()
+render_tour_overlay_script()

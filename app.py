@@ -172,14 +172,33 @@ ul[role="listbox"]{max-height:220px !important}
 .olts-sin-troncal{background:linear-gradient(135deg,#2d1f0a,#3d2a0a);border-left:3px solid #f6ad55;border-radius:0 10px 10px 0;padding:12px 18px;margin:8px 0 16px 0;font-size:12px;color:rgba(255,255,255,0.6);line-height:1.7}
 /* ── MODO MANUAL (tour interactivo) ── */
 .tour-anchor{height:0;margin:0;padding:0;overflow:hidden;line-height:0}
-/* Los botones reales de navegación quedan ocultos: la barra visible la dibuja
-   JavaScript directamente sobre <body>, no depende de la estructura interna
-   de Streamlit. Si por algún motivo esta regla no aplica, los botones reales
-   simplemente aparecen al final de la página — nunca bloquean la salida. */
-.tour-toolbar-marker{display:none}
-div[data-testid="element-container"]:has(.tour-toolbar-marker) + div[data-testid="stHorizontalBlock"]{
-    opacity:0 !important; height:0 !important; overflow:hidden !important;
-    pointer-events:none !important; margin:0 !important; padding:0 !important;
+/* Los 3 botones de navegación (Anterior/Siguiente/Salir) son SIEMPRE botones
+   reales de Streamlit — nunca elementos creados desde cero — para que el
+   clic funcione de forma 100% confiable incluso dentro de un st.dialog
+   (Admin/Editor), donde probamos que un elemento flotante "de la nada"
+   puede fallar al recibir clics reales por una rareza de apilamiento del
+   navegador.
+   BASE GARANTIZADA (pura CSS, no depende de JS): sticky arriba, siempre
+   visible desde el primer instante. El JS de render_tour_overlay_script()
+   la MEJORA reposicionándola pegada al tooltip cuando puede — si por
+   cualquier motivo el JS no llega a tiempo o falla, esta base sticky sigue
+   ahí, nunca desaparece. */
+.tour-toolbar-attach-marker{display:none}
+/* MODO MANUAL FLOTANTE:
+   Los botones reales de Streamlit se mantienen renderizados, pero ocultos.
+   La barra flotante inferior creada por JS dispara clics sobre estos botones
+   reales, por eso la navegación sigue funcionando dentro de st.dialog. */
+div[data-testid="element-container"]:has(.tour-toolbar-attach-marker) + div[data-testid="stHorizontalBlock"],
+div[data-testid="element-container"]:has(.tour-toolbar-attach-marker) + div [data-testid="stHorizontalBlock"],
+div[data-testid="stElementContainer"]:has(.tour-toolbar-attach-marker) + div[data-testid="stHorizontalBlock"],
+div[data-testid="stElementContainer"]:has(.tour-toolbar-attach-marker) + div [data-testid="stHorizontalBlock"]{
+    position:absolute !important;
+    opacity:0 !important;
+    pointer-events:none !important;
+    height:0 !important;
+    overflow:hidden !important;
+    margin:0 !important;
+    padding:0 !important;
 }
 .tour-toggle-marker{display:none}
 div[data-testid="element-container"]:has(.tour-toggle-marker) + div[data-testid="stHorizontalBlock"] button{
@@ -212,8 +231,15 @@ for k, v in {
     "editor_login_attempts": 0,
     "editor_lockout_until":  None,
     # ── MODO MANUAL (tour interactivo) ──
-    "modo_manual": False,
-    "tour_paso":   0,
+    "modo_manual_main":   False,
+    "tour_paso_main":     0,
+    "modo_manual_admin":  False,
+    "tour_paso_admin":    0,
+    "modo_manual_editor": False,
+    "tour_paso_editor":   0,
+    # Solo puede haber un modo manual activo a la vez.
+    "tour_activo":        None,
+    "tour_aviso":         None,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -890,7 +916,7 @@ TOUR_STEPS = [
         "anchor": "tour_nota_general",
         "tab": None,
         "titulo": "≡ Nota de corte de fecha",
-        "que_es": "Aviso que indica hasta qué fecha y hora corresponden los valores mostrados en toda la aplicación.",
+        "que_es": "Aviso que indica hasta qué fecha y hora corresponden los valores mostrados en toda la aplicación.Se actualiza con la última fecha y hora registrada en el histórico.",
         "para_que": "Evitar confusiones sobre si los datos están 'en vivo' o corresponden a un corte puntual.",
         "como_se_usa": "Solo lectura — revisa esta fecha antes de interpretar cualquier cifra.",
     },
@@ -943,7 +969,7 @@ TOUR_STEPS = [
         "titulo": "Gráficas de evolución",
         "que_es": "Tres gráficas de línea que muestran cómo han cambiado OLTs, Troncales y ONTs a lo largo de las cargas históricas.",
         "para_que": "Detectar tendencias de crecimiento o caídas anómalas en el tiempo.",
-        "como_se_usa": "Arrastra el control deslizante inferior (aparece si hay más de 8 lecturas) para ver periodos más antiguos. Pasa el cursor sobre un punto para ver el valor exacto.",
+        "como_se_usa": "Arrastra el control deslizante inferior (aparece si hay más de 8 lecturas) para ver periodos más antiguos. Pasa el cursor sobre un punto para ver el valor exacto.Se puede descargar la imagen desde el panel.",
     },
     {
         "anchor": "tour_zte_descarga_anterior",
@@ -992,7 +1018,104 @@ TOUR_STEPS = [
         "que_es": "El detalle final: cada troncal de la OLT seleccionada con su cantidad de ONTs asociadas.",
         "para_que": "Consultar el detalle exacto por puerto físico de la OLT.",
         "como_se_usa": "Solo lectura — se actualiza según los filtros que apliques arriba.",
-        "advertencia": "Huawei, ATP y ONNET funcionan exactamente igual a lo que acabas de ver — la única diferencia es que ONNET no maneja Shelf/Slot ni IP, porque su estructura de red es distinta. Con esto, terminamos el recorrido por las pestañas de datos y seguimos con el Panel de Administrador.",
+        "advertencia": "Huawei, ATP y ONNET funcionan exactamente igual a lo que acabas de ver — la única diferencia es que ONNET no maneja Shelf/Slot ni IP. Con esto termina este recorrido. El Panel de Administrador (⚙) y el Editor de Históricos (🗄) tienen su propio botón '🛈 Modo manual' una vez inicies sesión ahí — así puedes ver esas explicaciones sobre el panel real, con tus propios datos.",
+    },
+]
+
+# ── Capítulo 3: Panel de Administrador ──────────────────────────────────────
+# Este mini-tour vive DENTRO de dialogo_admin(), y solo se ofrece una vez el
+# usuario ya inició sesión de verdad (no hay bypass de login ni sesión falsa).
+# Por eso no tiene pasos de "tab" (no hay pestañas de página dentro del
+# diálogo) y en cambio usa "expander": si el paso apunta a contenido dentro
+# de un expander colapsado, el motor lo abre automáticamente antes de medir
+# posiciones — igual que hace con las pestañas en el tour principal.
+ADMIN_TOUR_STEPS = [
+    {
+        "anchor": "tour_admin_header",
+        "tab": None, "expander": None,
+        "titulo": "⚙ Panel de Administrador",
+        "que_es": "El encabezado del panel, con el botón para cerrar tu sesión de administrador.",
+        "para_que": "Salir del panel de forma segura cuando termines de cargar información.",
+        "como_se_usa": "Haz clic en '↩ Cerrar sesión' para salir; la próxima vez pedirá la contraseña de nuevo.",
+    },
+    {
+        "anchor": "tour_admin_zte",
+        "tab": None, "expander": "⊞ ZTE / ATP Combinado",
+        "titulo": "⊞ ZTE / ATP Combinado",
+        "que_es": "El procesador principal: toma los archivos Excel de ONTs y Troncales de ZTE (y opcionalmente ATP si vienen juntos) y calcula los totales de la red.",
+        "para_que": "Cargar una nueva lectura de la red ZTE/ATP y publicarla para que aparezca en las pestañas de datos.",
+        "como_se_usa": "Sube los archivos, confirma cuál grupo corresponde a Troncales, y pulsa 'Procesar'. Revisa el resultado antes de publicar.",
+        "advertencia": "Se procesan los tipos de archivos; ONTs y Troncales, cada uno tiene que tener un prefijo númerico distinto (ver manual de ejecución paso a paso).",
+    },
+    {
+        "anchor": "tour_admin_atp",
+        "tab": None, "expander": "⊞ ATP Independiente",
+        "titulo": "⊞ ATP Independiente",
+        "que_es": "Un procesador alterno solo para ATP, para cuando sus archivos no vienen junto con los de ZTE.",
+        "para_que": "Usarlo cuando el procesador combinado marcó las métricas de ATP en cero o cuando ATP se procesa por separado.",
+        "como_se_usa": "Igual que el combinado: sube archivos, confirma el grupo de Troncales, procesa y publica.",
+    },
+    {
+        "anchor": "tour_admin_haw",
+        "tab": None, "expander": "⊞ Huawei",
+        "titulo": "⊞ Huawei",
+        "que_es": "El procesador de la red Huawei, que toma archivos de Clientes y de Troncales.",
+        "para_que": "Cargar una nueva lectura de la red Huawei.",
+        "como_se_usa": "Sube al menos un archivo de Clientes y uno de Troncales, confirma el grupo y procesa.",
+    },
+    {
+        "anchor": "tour_admin_onnet",
+        "tab": None, "expander": "⊞ ONNET",
+        "titulo": "⊞ ONNET",
+        "que_es": "El procesador de la red ONNET, que usa un único archivo con la hoja 'BASE ONNET'.",
+        "para_que": "Cargar una nueva lectura de la red ONNET.",
+        "como_se_usa": "Sube el archivo con la hoja 'BASE ONNET' (columnas SERIAL, OLT, TRK RR, FECHA) y procesa.",
+    },
+    {
+        "anchor": "tour_admin_notas",
+        "tab": None, "expander": "⊙ Notas",
+        "titulo": "⊙ Notas",
+        "que_es": "El administrador de las notas que aparecen en cada pestaña (General, ZTE, Huawei, ATP, ONNET).",
+        "para_que": "Documentar eventos relevantes para quien consulte el dashboard.",
+        "como_se_usa": "Elige la pestaña destino, escribe la nota y agrégala. Borrar una nota pide confirmación con contraseña.",
+    },
+    {
+        "anchor": "tour_admin_password",
+        "tab": None, "expander": "⊙ Cambiar contraseña",
+        "titulo": "⊙ Cambiar contraseña",
+        "que_es": "El formulario para cambiar la contraseña de administrador (compartida con el Editor de Históricos).",
+        "para_que": "Rotar la contraseña periódicamente por seguridad.",
+        "como_se_usa": "Ingresa la contraseña actual, la nueva (mínimo 6 caracteres) y su confirmación.",
+        "advertencia": "Con esto termina la explicación del Panel de Administrador. El Editor de Históricos (🗄) tiene su propio '🛈 Modo manual' una vez inicies sesión ahí.",
+    },
+]
+
+# ── Capítulo 4: Editor de Históricos ────────────────────────────────────────
+EDITOR_TOUR_STEPS = [
+    {
+        "anchor": "tour_editor_selector",
+        "tab": None, "expander": None,
+        "titulo": "Selector de vendor",
+        "que_es": "El selector para elegir de qué proveedor quieres editar el histórico.",
+        "para_que": "Cambiar entre los históricos de ZTE, Huawei, ATP y ONNET.",
+        "como_se_usa": "Selecciona un vendor y la tabla de abajo se actualiza con su histórico completo.",
+    },
+    {
+        "anchor": "tour_editor_tabla",
+        "tab": None, "expander": None,
+        "titulo": "Tabla editable del histórico",
+        "que_es": "Cada fila es una carga histórica: fecha y sus totales de OLTs, Troncales y ONTs.",
+        "para_que": "Corregir un valor mal cargado, eliminar un registro duplicado o agregar uno manualmente.",
+        "como_se_usa": "Haz doble clic en una celda para editarla. Usa la papelera para borrar una fila, o el '+' al final para agregar una nueva.",
+    },
+    {
+        "anchor": "tour_editor_guardar",
+        "tab": None, "expander": None,
+        "titulo": "💾 Guardar cambios",
+        "que_es": "El botón que valida y guarda los cambios hechos en la tabla.",
+        "para_que": "Persistir tus ediciones — antes de guardar, nada se modifica en disco.",
+        "como_se_usa": "Haz clic para guardar. Si hay fechas duplicadas, vacías o valores negativos, se mostrará el error específico y no se guardará nada hasta corregirlo.",
+        "advertencia": "Con esto termina el recorrido completo de la aplicación.",
     },
 ]
 
@@ -1000,8 +1123,8 @@ def tour_anchor(anchor_id):
     """Marca invisible justo antes del elemento real que se quiere explicar."""
     st.markdown(f'<div class="tour-anchor" id="{anchor_id}"></div>', unsafe_allow_html=True)
 
-def _tour_tooltip_html(paso_idx, total):
-    step = TOUR_STEPS[paso_idx]
+def _tour_tooltip_html(steps, paso_idx, total):
+    step = steps[paso_idx]
     adv = ""
     if step.get("advertencia"):
         adv = (
@@ -1023,68 +1146,206 @@ def _tour_tooltip_html(paso_idx, total):
     {adv}
     """.replace("\n", "")
 
-def render_tour_toggle_button():
-    """Botón para activar el modo manual (fila propia, no toca el header existente)."""
-    st.markdown('<div class="tour-toggle-marker"></div>', unsafe_allow_html=True)
-    tcol, _ = st.columns([1, 6])
-    with tcol:
-        if st.button("🛈 Modo manual", key="btn_tour_toggle"):
-            st.session_state["modo_manual"] = not st.session_state["modo_manual"]
-            st.session_state["tour_paso"] = 0
-            st.rerun(scope="app")
+# Cada "instancia" de tour es independiente: tiene su propia bandera de
+# activación y su propio índice de paso en session_state (namespaced con el
+# sufijo `instancia`), su propia lista de pasos, y sus propios ids de DOM
+# (namespaced igual) para que nunca choquen entre sí ni con la instancia
+# principal. Esto permite tener el tour de la página (instancia="main"),
+# el del Panel de Administrador (instancia="admin") y el del Editor de
+# Históricos (instancia="editor") funcionando de forma completamente
+# independiente, reutilizando el mismo motor.
 
-def render_tour_toolbar():
-    """Botones REALES de Streamlit (ocultos vía CSS) que cambian el estado del
-    tour. La barra que el usuario VE la dibuja render_tour_overlay_script()
-    directamente en el navegador y, al hacer clic, dispara estos botones
-    reales — así el clic nunca depende de que Streamlit reposicione nada."""
-    if not st.session_state.get("modo_manual"):
+def _tour_keys(instancia):
+    return f"modo_manual_{instancia}", f"tour_paso_{instancia}"
+
+TOUR_NOMBRES = {
+    "main": "la pestaña general",
+    "admin": "el Panel de Administrador",
+    "editor": "el Editor de Históricos",
+}
+
+def _nombre_tour(instancia):
+    return TOUR_NOMBRES.get(instancia, instancia)
+
+def tour_esta_activo(instancia):
+    """Devuelve True si esa instancia del modo manual está activa."""
+    modo_key, _ = _tour_keys(instancia)
+    return bool(st.session_state.get(modo_key))
+
+def cerrar_tour(instancia=None):
+    """Cierra una instancia concreta del tour o todas si instancia=None."""
+    instancias = [instancia] if instancia else ["main", "admin", "editor"]
+    for inst in instancias:
+        modo_key, paso_key = _tour_keys(inst)
+        st.session_state[modo_key] = False
+        st.session_state[paso_key] = 0
+    activo = st.session_state.get("tour_activo")
+    if instancia is None or activo == instancia:
+        st.session_state["tour_activo"] = None
+
+def intentar_activar_tour(instancia):
+    """Evita abrir un modo manual si otro ya está activo."""
+    activo = st.session_state.get("tour_activo")
+
+    # Limpieza defensiva: si quedó un tour marcado como activo pero su bandera
+    # real ya está en False, lo liberamos para no bloquear al usuario.
+    if activo and not tour_esta_activo(activo):
+        st.session_state["tour_activo"] = None
+        activo = None
+
+    if activo and activo != instancia:
+        st.session_state["tour_aviso"] = (
+            f"⚠ Primero debes salir del modo manual de {_nombre_tour(activo)} "
+            f"antes de iniciar el modo manual de {_nombre_tour(instancia)}."
+        )
+        return False
+
+    st.session_state["tour_activo"] = instancia
+    return True
+
+def mostrar_tour_aviso():
+    """Muestra una advertencia breve cuando se intenta abrir otro manual."""
+    aviso = st.session_state.pop("tour_aviso", None)
+    if not aviso:
         return
-    total = len(TOUR_STEPS)
-    paso  = min(st.session_state.get("tour_paso", 0), total - 1)
-    st.session_state["tour_paso"] = paso
+    try:
+        st.toast(aviso, icon="⚠️")
+    except Exception:
+        st.warning(aviso)
 
-    st.markdown('<div class="tour-toolbar-marker"></div>', unsafe_allow_html=True)
+def render_tour_card(instancia, steps):
+    """Tarjeta de explicación NATIVA de Streamlit (Admin/Editor): se
+    renderiza en el flujo normal de la página, justo donde se llama —
+    inmediatamente antes de render_tour_toolbar(). A diferencia del tour
+    principal, aquí el texto y los botones NUNCA dependen de JS para ser
+    visibles: son elementos reales de Streamlit, en orden normal."""
+    modo_key, paso_key = _tour_keys(instancia)
+    if not st.session_state.get(modo_key):
+        return
+    total = len(steps)
+    paso = min(st.session_state.get(paso_key, 0), total - 1)
+    st.session_state[paso_key] = paso
+    tooltip_html = _tour_tooltip_html(steps, paso, total)
+    st.markdown(
+        f'<div class="tour-card-native">{tooltip_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+def render_tour_toggle_button(instancia, label="📖", help_text="Modo manual: explicación interactiva"):
+    """Botón para activar/desactivar el modo manual de una instancia del tour.
+    No crea su propia columna — el llamador decide dónde ubicarlo.
+
+    Nota de rendimiento:
+    no se fuerza st.rerun() aquí. El clic del botón ya dispara una ejecución
+    de Streamlit; forzar otro rerun adicional hace que el modo manual se sienta
+    más lento. Al actualizar session_state y continuar el flujo, los bloques que
+    vienen después (toolbar + overlay) ya reciben el nuevo estado en esta misma
+    ejecución.
+    """
+    modo_key, paso_key = _tour_keys(instancia)
+    st.session_state.setdefault(modo_key, False)
+    st.session_state.setdefault(paso_key, 0)
+    st.markdown('<div class="tour-toggle-marker"></div>', unsafe_allow_html=True)
+    if st.button(label, key=f"btn_tour_toggle_{instancia}", help=help_text):
+        if st.session_state.get(modo_key):
+            cerrar_tour(instancia)
+        elif intentar_activar_tour(instancia):
+            st.session_state[modo_key] = True
+            st.session_state[paso_key] = 0
+
+def render_tour_toolbar(instancia, steps):
+    """Botones REALES de Streamlit (Anterior/Siguiente/Salir). Nunca se
+    ocultan ni se recrean desde cero: render_tour_overlay_script() los
+    reposiciona con JS (position:fixed) para que visualmente queden pegados
+    justo debajo del tooltip flotante, dando la sensación de un solo bloque,
+    sin sacrificar la fiabilidad del clic nativo — esto es intencional:
+    un botón "flotante" creado enteramente por JS demostró fallar al recibir
+    clics reales dentro de un st.dialog (Admin/Editor), por una rareza de
+    apilamiento del navegador; un botón real reposicionado no tiene ese
+    problema, porque sigue siendo un elemento nativo de Streamlit."""
+    modo_key, paso_key = _tour_keys(instancia)
+    if not st.session_state.get(modo_key):
+        return
+    total = len(steps)
+    paso  = min(st.session_state.get(paso_key, 0), total - 1)
+    st.session_state[paso_key] = paso
+
+    st.markdown(f'<div class="tour-toolbar-attach-marker tour-toolbar-attach-marker-{instancia}"></div>', unsafe_allow_html=True)
     b1, b2, b3 = st.columns(3)
     with b1:
-        if st.button("◀ Anterior", key="btn_tour_prev"):
-            st.session_state["tour_paso"] = max(0, paso - 1)
-            st.rerun(scope="app")
+        if st.button("◀ Anterior", key=f"btn_tour_prev_{instancia}", disabled=(paso == 0)):
+            st.session_state[paso_key] = max(0, paso - 1)
     with b2:
-        if st.button("Siguiente ▶", key="btn_tour_next"):
-            st.session_state["tour_paso"] = min(total - 1, paso + 1)
-            st.rerun(scope="app")
+        if st.button("Siguiente ▶", key=f"btn_tour_next_{instancia}", disabled=(paso == total - 1)):
+            st.session_state[paso_key] = min(total - 1, paso + 1)
     with b3:
-        if st.button("✕ Salir", key="btn_tour_exit"):
-            st.session_state["modo_manual"] = False
-            st.session_state["tour_paso"] = 0
-            st.rerun(scope="app")
+        if st.button("✕ Salir", key=f"btn_tour_exit_{instancia}"):
+            cerrar_tour(instancia)
 
-def render_tour_overlay_script():
-    """Inyecta (o limpia) el overlay visual del tour: fondo oscuro, spotlight,
-    tooltip y una barra de navegación creada enteramente con JS/CSS propios
-    (no depende de reposicionar widgets de Streamlit). La barra, al hacer
-    clic, dispara los botones REALES ocultos de render_tour_toolbar().
-    Salidas de emergencia: botón "Salir" en la barra, clic en el fondo oscuro,
-    y tecla Escape — cualquiera de las tres cierra el tour."""
-    IDS = ["tour-overlay-backdrop", "tour-spotlight-box", "tour-tooltip-box", "tour-nav-bar"]
-    if st.session_state.get("modo_manual"):
-        total = len(TOUR_STEPS)
-        paso  = min(st.session_state.get("tour_paso", 0), total - 1)
-        step  = TOUR_STEPS[paso]
-        tooltip_html = _tour_tooltip_html(paso, total).replace("`", "\\`")
+def render_tour_overlay_script(instancia, steps, bloquear=True, barra_fija=False):
+    """Inyecta (o limpia) el overlay visual del tour: spotlight + tooltip.
+
+    Si bloquear=True (tour principal, fuera de cualquier diálogo): además
+    hay un fondo oscuro que bloquea clics reales en el resto de la página.
+    Salidas de emergencia: botón "Salir", clic en el fondo oscuro, tecla
+    Escape.
+
+    Si bloquear=False (dentro de un st.dialog: Admin/Editor): sin fondo
+    oscuro — el usuario ya inició sesión de verdad, así que no hace falta
+    bloquear su propio panel; solo se explica lo que ya está viendo.
+
+    barra_fija controla cómo se ven los botones Anterior/Siguiente/Salir:
+    - False (Admin/Editor): el tooltip se coloca al lado (izquierda o derecha)
+      de lo resaltado para no taparlo, ya que ahí sí hay un panel real debajo;
+      la botonera real se reposiciona con JS pegada justo debajo del tooltip,
+      como un solo bloque — "los botones ahí mismo en el texto".
+    - True (tour principal "main"): igual que en la versión 333 — el tooltip
+      se ubica arriba/abajo de lo resaltado (nunca se corta porque no tiene
+      que reservar espacio para una botonera pegada), y los botones viven en
+      una barra flotante fija en la parte inferior de la pantalla, creada por
+      JS, que dispara clics sobre los botones reales (ocultos vía CSS)."""
+    modo_key, paso_key = _tour_keys(instancia)
+    ids = [f"tour-overlay-backdrop-{instancia}", f"tour-spotlight-box-{instancia}",
+           f"tour-tooltip-box-{instancia}", f"tour-nav-bar-{instancia}"]
+    if st.session_state.get(modo_key):
+        total = len(steps)
+        paso  = min(st.session_state.get(paso_key, 0), total - 1)
+        step  = steps[paso]
+        tooltip_html = _tour_tooltip_html(steps, paso, total).replace("`", "\\`")
         anchor_id = step["anchor"]
         tab_js = "null" if step.get("tab") is None else repr(step["tab"])
+        expander_js = "null" if step.get("expander") is None else repr(step["expander"])
+        bloquear_js = str(bloquear).lower()
+        barra_fija_js = str(barra_fija).lower()
         script = f"""
         <script>
         try {{
             var w = window.parent, d = w.document;
-            {str(IDS)}.forEach(function(id){{
+            var bloquear = {bloquear_js};
+            {str(ids)}.forEach(function(id){{
                 var el = d.getElementById(id); if (el) el.remove();
             }});
 
+            // El botón real (Anterior/Siguiente/Salir) se busca solo dentro
+            // de su propio contenedor, marcado con tour-toolbar-attach-marker-{instancia},
+            // para nunca confundirlo con el de otra instancia si ambas existieran.
+            function contenedorBotones() {{
+                var marker = d.querySelector('.tour-toolbar-attach-marker-{instancia}');
+                if (!marker) return null;
+                var cont = marker.closest('[data-testid="stElementContainer"], [data-testid="element-container"]') || marker.parentElement;
+                var candidato = cont ? cont.nextElementSibling : null;
+                if (!candidato) return null;
+                // Streamlit a veces envuelve el bloque horizontal real en una
+                // capa extra (ej. stLayoutWrapper); nos aseguramos de devolver
+                // el stHorizontalBlock real, sea el candidato mismo o esté
+                // anidado dentro de él.
+                if (candidato.matches && candidato.matches('[data-testid="stHorizontalBlock"]')) return candidato;
+                return candidato.querySelector('[data-testid="stHorizontalBlock"]') || candidato;
+            }}
             function encontrarBoton(texto) {{
-                return Array.from(d.querySelectorAll('button')).find(function(b) {{
+                var cont = contenedorBotones();
+                if (!cont) return null;
+                return Array.from(cont.querySelectorAll('button')).find(function(b) {{
                     return b.innerText && b.innerText.trim() === texto;
                 }});
             }}
@@ -1095,26 +1356,45 @@ def render_tour_overlay_script():
             function activarPestana(texto) {{
                 if (!texto) return false;
                 var tabs = Array.from(d.querySelectorAll('button[role="tab"]'));
-                var tab = tabs.find(function(t) {{ return t.innerText && t.innerText.trim() === texto; }});
+                var tab = tabs.find(function(t) {{ return t.innerText && t.innerText.indexOf(texto) !== -1; }});
                 if (tab && tab.getAttribute('aria-selected') !== 'true') {{
                     tab.click();
                     return true;
                 }}
                 return false;
             }}
+            function abrirExpansor(texto) {{
+                if (!texto) return false;
+                var summaries = Array.from(d.querySelectorAll('summary'));
+                var sum = summaries.find(function(s) {{ return s.innerText && s.innerText.indexOf(texto) !== -1; }});
+                if (!sum) return false;
+                var details = sum.closest('details');
+                if (details && !details.open) {{
+                    sum.click();
+                    return true;
+                }}
+                return false;
+            }}
 
-            // ── Fondo oscuro (bloquea clics reales; clic aquí también sale) ──
-            var backdrop = d.createElement('div');
-            backdrop.id = 'tour-overlay-backdrop';
-            Object.assign(backdrop.style, {{
-                position:'fixed', top:'0', left:'0', width:'100vw', height:'100vh',
-                background:'rgba(0,0,0,0.55)', zIndex:'999990', pointerEvents:'auto', cursor:'default'
-            }});
-            backdrop.title = 'Clic para salir del modo manual';
-            backdrop.onclick = salir;
-            d.body.appendChild(backdrop);
+            // El spotlight/tooltip se anexan DENTRO del contenedor del diálogo
+            // (.stDialog) cuando hay uno abierto, para heredar su capa de
+            // apilamiento en vez de competir con ella desde <body>.
+            var contenedorOverlay = d.querySelector('.stDialog, [data-testid="stDialog"], [data-testid="stModal"]') || d.body;
 
-            // ── Tecla Escape también sale ──
+            if (bloquear) {{
+                // ── Fondo oscuro (bloquea clics reales; clic aquí también sale) ──
+                var backdrop = d.createElement('div');
+                backdrop.id = 'tour-overlay-backdrop-{instancia}';
+                Object.assign(backdrop.style, {{
+                    position:'fixed', top:'0', left:'0', width:'100vw', height:'100vh',
+                    background:'rgba(0,0,0,0.55)', zIndex:'2000090', pointerEvents:'auto', cursor:'default'
+                }});
+                backdrop.title = 'Clic para salir del modo manual';
+                backdrop.onclick = salir;
+                contenedorOverlay.appendChild(backdrop);
+            }}
+
+            // ── Tecla Escape también sale (en cualquier instancia) ──
             if (!w.__tourEscBound) {{
                 w.addEventListener('keydown', function(e) {{
                     if (e.key === 'Escape') {{ var b = encontrarBoton('✕ Salir'); if (b) b.click(); }}
@@ -1122,119 +1402,176 @@ def render_tour_overlay_script():
                 w.__tourEscBound = true;
             }}
 
-            // ── Cambiar de pestaña si el paso lo requiere, luego montar el spotlight ──
-            // (un pequeño retraso deja que Streamlit termine de mostrar la pestaña antes
-            // de medir posiciones con getBoundingClientRect)
+            // ── Cambiar de pestaña / abrir expander si el paso lo requiere ──
+            // (un pequeño retraso deja que Streamlit termine de mostrar el
+            // contenido antes de medir posiciones con getBoundingClientRect)
             var seCambioPestana = activarPestana({tab_js});
+            var seAbrioExpansor = abrirExpansor({expander_js});
 
             function montarSpotlight() {{
                 // Si el ancla no existe (ej. la sección aún no tiene datos cargados),
-                // el tooltip se muestra igual, centrado, en vez de desaparecer.
+                // simplemente no se resalta nada (el texto ya se muestra nativo arriba).
                 var anchor = d.getElementById('{anchor_id}');
                 var target = null;
                 if (anchor) {{
-                    var container = anchor.closest('[data-testid="stElementContainer"]') || anchor.parentElement;
+                    var container = anchor.closest('[data-testid="stElementContainer"], [data-testid="element-container"]') || anchor.parentElement;
                     target = container ? container.nextElementSibling : null;
                 }}
 
+                var barraFija = {barra_fija_js};
+
+                if (!barraFija) {{
+                    // ── Admin/Editor (modo "nativo"): el texto explicativo y
+                    // los botones Anterior/Siguiente/Salir YA están renderizados
+                    // por Streamlit en el flujo normal de la página (ver
+                    // render_tour_card / render_tour_toolbar), justo debajo de
+                    // las pestañas/bloques de texto — nunca dependen de JS para
+                    // ser visibles. Aquí solo resaltamos con un recuadro la
+                    // sección real a la que se refiere el paso actual, y hacemos
+                    // scroll hasta ella. ──
+                    if (target) {{
+                        var box = d.createElement('div');
+                        box.id = 'tour-spotlight-box-{instancia}';
+                        Object.assign(box.style, {{
+                            position:'fixed', zIndex:'2000095', border:'3px solid #63b3ed',
+                            borderRadius:'10px', boxShadow:'0 0 0 6000px rgba(0,0,0,0.35)',
+                            pointerEvents:'none', transition:'all 0.25s ease'
+                        }});
+                        contenedorOverlay.appendChild(box);
+
+                        function posicionarSpot() {{
+                            var r = target.getBoundingClientRect();
+                            box.style.top = (r.top-8)+'px'; box.style.left = (r.left-8)+'px';
+                            box.style.width = (r.width+16)+'px'; box.style.height = (r.height+16)+'px';
+                        }}
+                        posicionarSpot();
+                        w.addEventListener('resize', posicionarSpot);
+                        w.addEventListener('scroll', posicionarSpot, true);
+                        target.scrollIntoView({{behavior:'smooth', block:'center'}});
+                    }}
+                    return;
+                }}
+
+                // ── Main (barraFija=True): tooltip flotante + barra de
+                // navegación fija abajo, igual que en la versión 333. ──
                 if (target) {{
                     var box = d.createElement('div');
-                    box.id = 'tour-spotlight-box';
+                    box.id = 'tour-spotlight-box-{instancia}';
                     Object.assign(box.style, {{
-                        position:'fixed', zIndex:'999995', border:'3px solid #63b3ed',
+                        position:'fixed', zIndex:'2000095', border:'3px solid #63b3ed',
                         borderRadius:'10px', boxShadow:'0 0 0 6000px rgba(0,0,0,0.55)',
                         pointerEvents:'none', transition:'all 0.25s ease'
                     }});
-                    d.body.appendChild(box);
+                    contenedorOverlay.appendChild(box);
                 }}
 
                 var tip = d.createElement('div');
-                tip.id = 'tour-tooltip-box';
+                tip.id = 'tour-tooltip-box-{instancia}';
                 Object.assign(tip.style, {{
-                    position:'fixed', zIndex:'999996', maxWidth:'340px',
+                    position:'fixed', zIndex:'2000096', maxWidth:'340px', minWidth:'340px',
                     background:'#1e2a4a', border:'1px solid rgba(99,179,237,0.4)',
                     borderRadius:'12px', padding:'14px 16px', color:'#fff',
                     boxShadow:'0 8px 30px rgba(0,0,0,0.5)', pointerEvents:'none'
                 }});
                 tip.innerHTML = `{tooltip_html}`;
-                d.body.appendChild(tip);
+                contenedorOverlay.appendChild(tip);
+
+                var anchoTip = 340;
+                var margen = 16;
+                var alturaTip = tip.getBoundingClientRect().height || 220;
+
+                if (target) target.scrollIntoView({{behavior:'auto', block:'center'}});
 
                 function posicionar() {{
+                    var tipTop, tipLeft;
+                    var alturaTipReal = tip.getBoundingClientRect().height || alturaTip;
+
                     if (target) {{
                         var r = target.getBoundingClientRect();
-                        var box2 = d.getElementById('tour-spotlight-box');
+                        var box2 = d.getElementById('tour-spotlight-box-{instancia}');
                         if (box2) {{
                             box2.style.top = (r.top-8)+'px'; box2.style.left = (r.left-8)+'px';
                             box2.style.width = (r.width+16)+'px'; box2.style.height = (r.height+16)+'px';
                         }}
-                        var tipTop = r.bottom + 16;
-                        if (tipTop + 220 > w.innerHeight) tipTop = Math.max(16, r.top - 236);
-                        tip.style.top = tipTop+'px';
-                        var tipLeft = Math.min(Math.max(16, r.left), w.innerWidth-356);
-                        tip.style.left = tipLeft+'px';
+
+                        // Igual que en la versión 333 — arriba/abajo del
+                        // elemento resaltado (nunca se corta, porque no hay
+                        // que reservar espacio para una botonera pegada: la
+                        // barra de navegación es independiente, fija abajo
+                        // de la pantalla).
+                        var tipTopF = r.bottom + margen;
+                        if (tipTopF + alturaTipReal + 90 > w.innerHeight) {{
+                            tipTopF = Math.max(margen, r.top - alturaTipReal - margen);
+                        }}
+                        tipTop = tipTopF;
+                        tipLeft = Math.min(Math.max(margen, r.left), w.innerWidth - anchoTip - margen);
                     }} else {{
                         // Sin ancla disponible: centrar el tooltip en pantalla.
-                        tip.style.top = (w.innerHeight/2 - 130)+'px';
-                        tip.style.left = (w.innerWidth/2 - 170)+'px';
+                        tipTop = Math.max(16, w.innerHeight/2 - alturaTip/2);
+                        tipLeft = w.innerWidth/2 - 170;
                     }}
+                    tip.style.top = tipTop+'px';
+                    tip.style.left = tipLeft+'px';
                 }}
                 posicionar();
                 w.addEventListener('resize', posicionar);
                 w.addEventListener('scroll', posicionar, true);
-                if (target) target.scrollIntoView({{behavior:'smooth', block:'center'}});
+
+                // ── Barra de navegación flotante fija abajo (igual que en
+                // la versión 333). Dispara clics sobre los botones reales
+                // ocultos (encontrarBoton), así el clic sigue siendo 100%
+                // nativo de Streamlit. ──
+                var bar = d.createElement('div');
+                bar.id = 'tour-nav-bar-{instancia}';
+                Object.assign(bar.style, {{
+                    position:'fixed', bottom:'24px', left:'50%', transform:'translateX(-50%)',
+                    zIndex:'2000099', background:'#1a2035', border:'1px solid rgba(99,179,237,0.45)',
+                    borderRadius:'14px', padding:'10px 14px', boxShadow:'0 10px 34px rgba(0,0,0,0.55)',
+                    display:'flex', gap:'10px', alignItems:'center', pointerEvents:'auto',
+                    fontFamily:'inherit'
+                }});
+
+                function crearBotonNav(texto, activo) {{
+                    var btn = d.createElement('button');
+                    btn.innerText = texto;
+                    Object.assign(btn.style, {{
+                        background: activo ? 'rgba(99,179,237,0.16)' : 'rgba(255,255,255,0.05)',
+                        border: '1px solid ' + (activo ? 'rgba(99,179,237,0.55)' : 'rgba(255,255,255,0.15)'),
+                        color: activo ? '#63b3ed' : 'rgba(255,255,255,0.35)',
+                        borderRadius:'8px', padding:'7px 14px', fontSize:'13px', cursor:'pointer'
+                    }});
+                    return btn;
+                }}
+
+                var btnPrev = crearBotonNav('◀ Anterior', {str(paso > 0).lower()});
+                btnPrev.onclick = function() {{ var b = encontrarBoton('◀ Anterior'); if (b) b.click(); }};
+                if ({str(paso == 0).lower()}) btnPrev.disabled = true;
+
+                var contador = d.createElement('div');
+                contador.innerText = '{paso+1} / {total}';
+                Object.assign(contador.style, {{ color:'rgba(255,255,255,0.55)', fontSize:'12px', padding:'0 4px' }});
+
+                var btnNext = crearBotonNav('Siguiente ▶', {str(paso < total - 1).lower()});
+                btnNext.onclick = function() {{ var b = encontrarBoton('Siguiente ▶'); if (b) b.click(); }};
+                if ({str(paso == total - 1).lower()}) btnNext.disabled = true;
+
+                var btnExit = crearBotonNav('✕ Salir', true);
+                btnExit.style.color = '#f6ad55';
+                btnExit.style.borderColor = 'rgba(246,173,85,0.5)';
+                btnExit.onclick = salir;
+
+                bar.appendChild(btnPrev);
+                bar.appendChild(contador);
+                bar.appendChild(btnNext);
+                bar.appendChild(btnExit);
+                d.body.appendChild(bar);
             }}
 
-            if (seCambioPestana) {{
+            if (seCambioPestana || seAbrioExpansor) {{
                 setTimeout(montarSpotlight, 80);
             }} else {{
                 montarSpotlight();
             }}
-
-            // ── Barra de navegación visible (100% propia, siempre encima de todo) ──
-            var bar = d.createElement('div');
-            bar.id = 'tour-nav-bar';
-            Object.assign(bar.style, {{
-                position:'fixed', bottom:'24px', left:'50%', transform:'translateX(-50%)',
-                zIndex:'999999', background:'#1a2035', border:'1px solid rgba(99,179,237,0.45)',
-                borderRadius:'14px', padding:'10px 14px', boxShadow:'0 10px 34px rgba(0,0,0,0.55)',
-                display:'flex', gap:'10px', alignItems:'center', pointerEvents:'auto',
-                fontFamily:'inherit'
-            }});
-
-            function crearBoton(texto, activo) {{
-                var btn = d.createElement('button');
-                btn.innerText = texto;
-                Object.assign(btn.style, {{
-                    background: activo ? 'rgba(99,179,237,0.16)' : 'rgba(255,255,255,0.05)',
-                    border: '1px solid ' + (activo ? 'rgba(99,179,237,0.55)' : 'rgba(255,255,255,0.15)'),
-                    color: activo ? '#63b3ed' : 'rgba(255,255,255,0.35)',
-                    borderRadius:'8px', padding:'7px 14px', fontSize:'13px', cursor:'pointer'
-                }});
-                return btn;
-            }}
-
-            var btnPrev = crearBoton('◀ Anterior', {str(paso > 0).lower()});
-            btnPrev.onclick = function() {{ var b = encontrarBoton('◀ Anterior'); if (b) b.click(); }};
-            if ({str(paso == 0).lower()}) btnPrev.disabled = true;
-
-            var contador = d.createElement('div');
-            contador.innerText = '{paso+1} / {total}';
-            Object.assign(contador.style, {{ color:'rgba(255,255,255,0.55)', fontSize:'12px', padding:'0 4px' }});
-
-            var btnNext = crearBoton('Siguiente ▶', {str(paso < total - 1).lower()});
-            btnNext.onclick = function() {{ var b = encontrarBoton('Siguiente ▶'); if (b) b.click(); }};
-            if ({str(paso == total - 1).lower()}) btnNext.disabled = true;
-
-            var btnExit = crearBoton('✕ Salir', true);
-            btnExit.style.color = '#f6ad55';
-            btnExit.style.borderColor = 'rgba(246,173,85,0.5)';
-            btnExit.onclick = salir;
-
-            bar.appendChild(btnPrev);
-            bar.appendChild(contador);
-            bar.appendChild(btnNext);
-            bar.appendChild(btnExit);
-            d.body.appendChild(bar);
 
         }} catch(e) {{ console.error('tour overlay error', e); }}
         </script>
@@ -1245,7 +1582,19 @@ def render_tour_overlay_script():
         <script>
         try {
             var w = window.parent, d = w.document;
-            """ + str(IDS) + """.forEach(function(id){
+            var marker = d.querySelector('.tour-toolbar-attach-marker-""" + instancia + """');
+            if (marker) {
+                var cont = marker.closest('[data-testid="stElementContainer"], [data-testid="element-container"]') || marker.parentElement;
+                var candidato = cont ? cont.nextElementSibling : null;
+                var boton = null;
+                if (candidato) {
+                    boton = (candidato.matches && candidato.matches('[data-testid="stHorizontalBlock"]'))
+                        ? candidato
+                        : (candidato.querySelector('[data-testid="stHorizontalBlock"]') || candidato);
+                }
+                if (boton) { boton.style.opacity = '0'; boton.style.position = ''; }
+            }
+            """ + str(ids) + """.forEach(function(id){
                 var el = d.getElementById(id); if (el) el.remove();
             });
         } catch(e) {}
@@ -2112,6 +2461,7 @@ def _publicar(key, metricas_list):
 # ── Paneles admin ─────────────────────────────────────────────────────────────
 @st.fragment
 def panel_zte():
+    tour_anchor("tour_admin_zte")
     st.markdown('<div class="section-title panel-zte">⊞ ZTE / ATP Combinado</div>', unsafe_allow_html=True)
 
     # Si ya hay resultado, mostrar directamente sin uploader
@@ -2179,6 +2529,7 @@ def panel_zte():
 
 @st.fragment
 def panel_atp():
+    tour_anchor("tour_admin_atp")
     st.markdown('<div class="section-title panel-atp">⊞ ATP Independiente</div>', unsafe_allow_html=True)
     st.markdown('<div class="nota"><div class="nota-texto">Usa este procesador cuando ATP no estaba incluido en los archivos ZTE o sus métricas quedaron en 0.</div></div>', unsafe_allow_html=True)
 
@@ -2254,6 +2605,7 @@ def panel_atp():
 
 @st.fragment
 def panel_huawei():
+    tour_anchor("tour_admin_haw")
     st.markdown('<div class="section-title panel-haw">⊞ Huawei</div>', unsafe_allow_html=True)
 
     if st.session_state.get("resultado_haw"):
@@ -2311,6 +2663,7 @@ def panel_huawei():
 
 @st.fragment
 def panel_onnet():
+    tour_anchor("tour_admin_onnet")
     st.markdown('<div class="section-title panel-onnet">⊞ ONNET</div>', unsafe_allow_html=True)
 
     if st.session_state.get("resultado_onnet"):
@@ -2366,6 +2719,7 @@ def panel_onnet():
 
 @st.fragment
 def panel_notas():
+    tour_anchor("tour_admin_notas")
     st.markdown('<div class="section-title">⊙ Notas</div>', unsafe_allow_html=True)
 
     # ── Agregar nota ──
@@ -2441,6 +2795,7 @@ def panel_notas():
 
 
 def panel_password():
+    tour_anchor("tour_admin_password")
     st.markdown('<div class="section-title">⊙ Cambiar contraseña</div>', unsafe_allow_html=True)
     actual  = st.text_input("Contraseña actual",          type="password", key="pwd_actual")
     nueva   = st.text_input("Nueva contraseña",            type="password", key="pwd_nueva")
@@ -2494,16 +2849,20 @@ def dialogo_admin():
                     else:
                         mostrar_error(f"Contraseña incorrecta. {restantes} intento(s) restante(s).")
     else:
+        tour_anchor("tour_admin_header")
         col_t, col_s = st.columns([4, 1])
         with col_t:
             st.markdown("#### ⚙ Panel de Administrador")
         with col_s:
             if st.button("↩ Cerrar sesión", key="btn_logout"):
+                cerrar_tour("admin")
                 st.session_state.admin_logged      = False
                 st.session_state["admin_dialog_open"] = False
                 st.rerun(scope="app")
 
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        render_tour_toggle_button("admin", label="📖", help_text="Modo manual: explica este panel")
+        render_tour_toolbar("admin", ADMIN_TOUR_STEPS)
 
         with st.expander("⊞ ZTE / ATP Combinado", expanded=True):
             panel_zte()
@@ -2522,11 +2881,14 @@ def dialogo_admin():
         with st.expander("⊙ Cambiar contraseña"):
             panel_password()
 
+        render_tour_overlay_script("admin", ADMIN_TOUR_STEPS, bloquear=False, barra_fija=True)
+
 
 @st.fragment
 def panel_editor_historicos():
     st.markdown('<div class="section-title">🗄 Editar histórico</div>', unsafe_allow_html=True)
 
+    tour_anchor("tour_editor_selector")
     vendor_sel = st.selectbox(
         "Vendor", ["ZTE", "HAW", "ATP", "ONNET"],
         format_func=lambda v: VENDOR_NOMBRE.get(v, v), key="editor_vendor_select",
@@ -2552,6 +2914,7 @@ def panel_editor_historicos():
         unsafe_allow_html=True,
     )
 
+    tour_anchor("tour_editor_tabla")
     df_editado = st.data_editor(
         df,
         num_rows="dynamic",
@@ -2575,6 +2938,7 @@ def panel_editor_historicos():
 
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
+    tour_anchor("tour_editor_guardar")
     if st.button("💾 Guardar cambios", key=f"btn_guardar_editor_{vendor_sel}", type="primary"):
         errores = validar_historico_editado(df_editado)
         if errores:
@@ -2636,12 +3000,17 @@ def dialogo_editor_historicos():
             st.markdown("#### 🗄 Editor de Históricos")
         with col_s:
             if st.button("↩ Cerrar sesión", key="btn_logout_editor"):
+                cerrar_tour("editor")
                 st.session_state.editor_logged      = False
                 st.session_state["editor_dialog_open"] = False
                 st.rerun(scope="app")
 
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        render_tour_toggle_button("editor", label="📖", help_text="Modo manual: explica este panel")
+        render_tour_toolbar("editor", EDITOR_TOUR_STEPS)
         panel_editor_historicos()
+
+        render_tour_overlay_script("editor", EDITOR_TOUR_STEPS, bloquear=False, barra_fija=True)
 
 
 # ── Notas públicas (solo lectura) ────────────────────────────────────────────
@@ -2663,7 +3032,7 @@ def mostrar_notas_publicas(vendor_tag):
 # ── Header ────────────────────────────────────────────────────────────────────
 hist = cargar()
 
-h0, h1, h2, h3, h4 = st.columns([0.35, 3, 1, 0.3, 0.3])
+h0, h1, h2, h_manual, h3, h4 = st.columns([0.35, 3, 1, 0.4, 0.3, 0.3])
 
 with h0:
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
@@ -2682,6 +3051,8 @@ with h2:
     if st.button("⟳ Actualizar datos"):
         st.cache_data.clear()
         st.rerun(scope="app")
+with h_manual:
+    render_tour_toggle_button("main", label="📖", help_text="Modo manual: explicación interactiva de la página")
 with h3:
     tour_anchor("tour_btn_admin")
     if st.button("⚙", key="btn_abrir_admin", help="Panel de administrador"):
@@ -2693,8 +3064,7 @@ with h4:
         st.session_state["editor_dialog_open"] = True
         st.session_state["admin_dialog_open"]  = False
 
-# ── MODO MANUAL: fila propia debajo del header, no altera el header original ──
-render_tour_toggle_button()
+mostrar_tour_aviso()
 
 # Abre (o reabre tras cualquier rerun: login, publicar, nuevo procesamiento, etc.)
 # los diálogos mientras sus banderas sigan activas, para que no se sienta
@@ -2782,5 +3152,5 @@ with t4:
 
 # ── MODO MANUAL: se renderiza al final para que el overlay encuentre ──
 # ── todos los elementos ya dibujados en el DOM. ──
-render_tour_toolbar()
-render_tour_overlay_script()
+render_tour_toolbar("main", TOUR_STEPS)
+render_tour_overlay_script("main", TOUR_STEPS, barra_fija=True)
